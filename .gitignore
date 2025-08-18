@@ -1,2 +1,6 @@
 mmdetection3d
 viz
+cache
+results
+.vscode
+runs/

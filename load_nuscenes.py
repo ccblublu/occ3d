@@ -28,7 +28,7 @@ import pypatchworkpp
 
 from ops.mmdetection3d.tools.misc.browse_dataset import show_det_data, show_result
 # @DATASETS.register_module()
-
+NUSC_SEG_MAP = {0: 'noise', 1: 'animal', 2: 'human.pedestrian.adult', 3: 'human.pedestrian.child', 4: 'human.pedestrian.construction_worker', 5: 'human.pedestrian.personal_mobility', 6: 'human.pedestrian.police_officer', 7: 'human.pedestrian.stroller', 8: 'human.pedestrian.wheelchair', 9: 'movable_object.barrier', 10: 'movable_object.debris', 11: 'movable_object.pushable_pullable', 12: 'movable_object.trafficcone', 13: 'static_object.bicycle_rack', 14: 'vehicle.bicycle', 15: 'vehicle.bus.bendy', 16: 'vehicle.bus.rigid', 17: 'vehicle.car', 18: 'vehicle.construction', 19: 'vehicle.emergency.ambulance', 20: 'vehicle.emergency.police', 21: 'vehicle.motorcycle', 22: 'vehicle.trailer', 23: 'vehicle.truck', 24: 'flat.driveable_surface', 25: 'flat.other', 26: 'flat.sidewalk', 27: 'flat.terrain', 28: 'static.manmade', 29: 'static.other', 30: 'static.vegetation', 31: 'vehicle.ego'}
 
 def rotate_yaw(yaw):
     if yaw > np.pi:
@@ -161,7 +161,7 @@ class SequenceDataset(Dataset):
         input_dict = dict(
             sample_idx=info['token'],
             pts_filename=info['lidar_path'],
-            # sweeps=info['sweeps'],
+            is_key_frame=info['is_key_frame'],
             timestamp=info['timestamp'] / 1e6,
         )
         # if not self.test_mode:
@@ -177,7 +177,10 @@ class SequenceDataset(Dataset):
         gt_bboxes_3d = info["annos"]['gt_boxes']
         gt_names_3d = info["annos"]['gt_names']
         gt_bboxes_id = info["annos"]['gt_inst_token']
-
+        if info['is_key_frame']:
+            gt_pts_semantic_mask = np.fromfile(info['pts_semantic_mask_path'], dtype=np.uint8)
+        else:
+            gt_pts_semantic_mask = None
         # turn original box type to target box type
         gt_bboxes_3d = LiDARInstance3DBoxeswithID(
             gt_bboxes_3d,
@@ -191,6 +194,7 @@ class SequenceDataset(Dataset):
             gt_bboxes_id=gt_bboxes_id,
             gt_names=gt_names_3d,
             axis_align_matrix=info['axis_align_matrix'],
+            gt_pts_semantic_mask=gt_pts_semantic_mask,
             )
         return anns_results
     
@@ -207,7 +211,7 @@ def init_dataset(data, token):
                 use_dim=5),
             dict(type="RemoveSelfCenter", radius=2.5),
             dict(
-                type='RemoveGround',
+                type='GetGround',
             ),
             # dict(
             #     type='LoadPointsFromMultiSweeps',
@@ -309,6 +313,9 @@ def main(data_path, info_path):
             annos = example['ann_info']
             image_idx = example['sample_idx']
             points = example['points'].tensor.numpy()
+            gt_pts_semantic_mask = annos['gt_pts_semantic_mask'] #!(n, )
+            if gt_pts_semantic_mask is None:
+                gt_pts_semantic_mask = np.zeros(len(points), dtype=np.uint8)
             gt_boxes_3d = annos['gt_bboxes_3d'].tensor
             names = annos['gt_names']
             gt_boxes_id = annos['gt_bboxes_id']
@@ -396,12 +403,12 @@ def viz_mesh(mesh, gt_box=None, save=True):
 
 if __name__ == '__main__':
     from ops.mmdetection3d.tools.data_converter.nuscenes_converter import create_nuscenes_infos
-    create_nuscenes_infos(
-        # '/media/chen/Elements/nuScenes/raw/Trainval/',
-        "/media/chen/data/nusecnes/v1.0-mini",
-        info_prefix="test",
-        version='v1.0-mini',
-        get_seg=True)
+    # create_nuscenes_infos(
+    #     # '/media/chen/Elements/nuScenes/raw/Trainval/',
+    #     "/media/chen/data/nusecnes/v1.0-mini",
+    #     info_prefix="test",
+    #     version='v1.0-mini',
+    #     get_seg=True)
 
     main('/media/chen/data/nusecnes/v1.0-mini/', 'test_infos_train.pkl')
     obj_points_bank = pickle.load(open("tmp.pkl", "rb"))

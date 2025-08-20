@@ -4,6 +4,7 @@ import pickle
 from tkinter import _flatten
 import pyquaternion
 from scipy.spatial.transform import Rotation as R
+from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 from tqdm.contrib.concurrent import thread_map
 from functools import partial
@@ -27,7 +28,9 @@ from mmdet3d.core.bbox import box_np_ops
 import pypatchworkpp
 
 from ops.mmdetection3d.tools.misc.browse_dataset import show_det_data, show_result
-# @DATASETS.register_module()
+from utils.ops import generate_35_category_colors
+
+
 NUSC_SEG_MAP = {0: 'noise', 1: 'animal', 2: 'human.pedestrian.adult', 3: 'human.pedestrian.child', 4: 'human.pedestrian.construction_worker', 5: 'human.pedestrian.personal_mobility', 6: 'human.pedestrian.police_officer', 7: 'human.pedestrian.stroller', 8: 'human.pedestrian.wheelchair', 9: 'movable_object.barrier', 10: 'movable_object.debris', 11: 'movable_object.pushable_pullable', 12: 'movable_object.trafficcone', 13: 'static_object.bicycle_rack', 14: 'vehicle.bicycle', 15: 'vehicle.bus.bendy', 16: 'vehicle.bus.rigid', 17: 'vehicle.car', 18: 'vehicle.construction', 19: 'vehicle.emergency.ambulance', 20: 'vehicle.emergency.police', 21: 'vehicle.motorcycle', 22: 'vehicle.trailer', 23: 'vehicle.truck', 24: 'flat.driveable_surface', 25: 'flat.other', 26: 'flat.sidewalk', 27: 'flat.terrain', 28: 'static.manmade', 29: 'static.other', 30: 'static.vegetation', 31: 'vehicle.ego'}
 
 def rotate_yaw(yaw):
@@ -86,6 +89,8 @@ class SequenceDataset(Dataset):
         self.data_infos = sorted(self.data_infos, key=lambda x: x['timestamp'])
         self.start_lidar2global = self.get_lidar2global(0)
         self.token = token
+        self.key_frame_index = self.get_key_frame_index()
+        self.timestamps = np.array([info['timestamp'] for info in self.data_infos])
 
         if pipeline is not None:
             self.pipeline = Compose(pipeline)
@@ -100,6 +105,10 @@ class SequenceDataset(Dataset):
         lidar2global = ego2global @ lidar2ego
         return lidar2global
 
+    def get_key_frame_index(self):
+
+        return np.array([i for i, info in enumerate(self.data_infos) if info['is_key_frame']])
+    
     def merge_sweeps(self, data):
         '''
         process lidar sweeps as key frame
@@ -118,14 +127,19 @@ class SequenceDataset(Dataset):
         '''
         data = sorted(data, key=lambda x: x['timestamp'])
         out = []
+        key_frame_timestamps = []
         for i in range(len(data)):
             info = data[i]
+            key_frame_timestamps.append(info['timestamp'])
             # print(info['token'])
             sweeps = info.pop("sweeps")
             info['annos'] = {'gt_boxes': info.pop('gt_boxes'), 'gt_names':info.pop('gt_names'), "gt_inst_token":info.pop('gt_inst_token')}
             info["is_key_frame"] = True
             out.append(info)
             for sweep in sweeps:
+                #? 排查timestamp重叠的问题: nuscenes数据集中的sweeps的最后一帧为关键帧，需要额外剔除
+                if sweep['timestamp'] in key_frame_timestamps:
+                    continue
                 sweep['lidar_path'] = sweep['data_path']    
                 sweep['lidar2ego_translation'] = sweep['sensor2ego_translation']
                 sweep['lidar2ego_rotation'] = sweep['sensor2ego_rotation']
@@ -162,7 +176,7 @@ class SequenceDataset(Dataset):
             sample_idx=info['token'],
             pts_filename=info['lidar_path'],
             is_key_frame=info['is_key_frame'],
-            timestamp=info['timestamp'] / 1e6,
+            timestamp=info['timestamp'],
         )
         # if not self.test_mode:
         annos = self.get_ann_info(index)
@@ -296,6 +310,53 @@ def get_ground_mesh(ground_points, grid_size=5):
     # voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(mesh_points,
     #                                                         voxel_size=0.05)
 
+def propagate_labels_with_knn(keyframe_points, keyframe_labels, 
+                             non_keyframe_points, k=5, distance_threshold=0.5):
+    """
+    使用KNN将关键帧的分割标签传播到非关键帧点云
+    
+    参数:
+        keyframe_points (np.ndarray): (N, 3) 关键帧点云坐标
+        keyframe_labels (np.ndarray): (N,) 关键帧点云的分割标签
+        non_keyframe_points (np.ndarray): (M, 3) 非关键帧点云坐标
+        k (int): KNN中使用的最近邻数量
+        distance_threshold (float): 最大距离阈值，超过此距离的点不分配标签
+        
+    返回:
+        non_keyframe_labels (np.ndarray): (M,) 非关键帧点云的预测标签
+    """
+    # 1. 创建KNN模型并拟合关键帧数据
+    knn = NearestNeighbors(n_neighbors=k, algorithm='kd_tree')
+    knn.fit(keyframe_points)
+    
+    # 2. 为非关键帧点云找到k个最近邻
+    distances, indices = knn.kneighbors(non_keyframe_points)
+    
+    # 3. 获取最近邻点的标签
+    neighbor_labels = keyframe_labels[indices]
+    
+    # 4. 使用多数投票确定标签
+    # 对于每个点，统计k个邻居中最常见的标签
+    non_keyframe_labels = np.zeros(len(non_keyframe_points), dtype=keyframe_labels.dtype)
+    
+    # 处理每个点
+    for i in range(len(non_keyframe_points)):
+        # 检查最小距离是否在阈值内
+        if distances[i].min() > distance_threshold:
+            # 超出距离阈值的点分配默认标签（例如背景或未定义）
+            non_keyframe_labels[i] = 0
+            continue
+            
+        # 获取邻居标签
+        labels = neighbor_labels[i]
+        
+        # 多数投票
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        counts[unique_labels==0] = -1 # 将背景标签的计数设为-1，使其不会影响多数投票
+        non_keyframe_labels[i] = unique_labels[np.argmax(counts)]
+    
+    return non_keyframe_labels
+
 
 def main(data_path, info_path):
 
@@ -303,19 +364,25 @@ def main(data_path, info_path):
     for i in track_iter_progress(list(range(len(dataset)))):
         seq_dataset = dataset[i]
         obj_points_bank = {}
-        ground_points_bank = {}
-        nonground_points_bank = {}
+        # ground_points_bank = {}
+        # nonground_points_bank = {}
+        points_bank = {}
+        key_frame_indices = seq_dataset.key_frame_index
+        timestamps = seq_dataset.timestamps
+        key_frame_timestamps = timestamps[key_frame_indices]
+        waiting_for_key_frame = defaultdict(list)
         for j in track_iter_progress(list(range(len(seq_dataset)))):
             input_dict = seq_dataset.get_data_info(j)
             seq_dataset.pre_pipeline(input_dict)
             example = seq_dataset.pipeline(input_dict)
-            
             annos = example['ann_info']
+            timestamp = example['timestamp']
             image_idx = example['sample_idx']
             points = example['points'].tensor.numpy()
             gt_pts_semantic_mask = annos['gt_pts_semantic_mask'] #!(n, )
             if gt_pts_semantic_mask is None:
                 gt_pts_semantic_mask = np.zeros(len(points), dtype=np.uint8)
+            points = np.concatenate((points, gt_pts_semantic_mask[:, None]), axis=1)
             gt_boxes_3d = annos['gt_bboxes_3d'].tensor
             names = annos['gt_names']
             gt_boxes_id = annos['gt_bboxes_id']
@@ -327,10 +394,42 @@ def main(data_path, info_path):
             nonground_points_indices = example['nonground_idx']
             background_and_ground_points_indices = np.intersect1d(ground_points_indices, background_points_indices, assume_unique=True)
             background_and_nonground_points_indices = np.intersect1d(nonground_points_indices, background_points_indices, assume_unique=True)
+            # points_bank[timestamp] = points[background_points_indices]
+
             # left_points = example['points'][ground_points_indices]
             # left_points = points[background_points_indices]
-            nonground_points_bank[example['timestamp']] =  points[background_and_nonground_points_indices]
-            ground_points_bank[example['timestamp']] = points[background_and_ground_points_indices]
+            # nonground_points_bank[example['timestamp']] =  points[background_and_nonground_points_indices]
+            # ground_points_bank[example['timestamp']] = points[background_and_ground_points_indices]
+            
+
+
+
+            if not example['is_key_frame']:
+                closed_key_frame_idx = np.argmin(np.abs(key_frame_timestamps - timestamp))
+                keyframe_timesamp = key_frame_timestamps[closed_key_frame_idx]
+
+                if keyframe_timesamp not in points_bank:
+                    waiting_for_key_frame[keyframe_timesamp].append(timestamp)
+                else:
+                    # keyframe_timesamp = key_frame_timestamps[closed_key_frame_idx]
+                    # keyframe_points = np.concatenate((nonground_points_bank[keyframe_timesamp], ground_points_bank[keyframe_timesamp]))
+                    keyframe_points = points_bank[keyframe_timesamp]
+                    keyframe_labels = keyframe_points[:, -1]
+                    labels = propagate_labels_with_knn(keyframe_points[:, :3], keyframe_labels, points[:, :3])
+                    points[:, -1] = labels
+            elif timestamp in waiting_for_key_frame:
+                non_key_frames = waiting_for_key_frame.pop(timestamp)
+                for non_key_frames_timestamp in non_key_frames:
+                    non_keyframe_points = points_bank[non_key_frames_timestamp]
+                    non_keyframe_labels = propagate_labels_with_knn(points[background_points_indices, :3], points[background_points_indices,-1], non_keyframe_points[:, :3])
+                    points_bank[non_key_frames_timestamp][:, -1] = non_keyframe_labels
+
+            points_bank[timestamp] = points[background_points_indices]
+
+
+
+
+
             # show_result(points=points, gt_bboxes=gt_boxes_3d.clone(), pred_bboxes=None, out_dir="./viz", filename=example['sample_idx'], show=True, snapshot=True)
             
             for i, (obj_id, box) in enumerate(zip(gt_boxes_id, gt_boxes_3d.numpy())):
@@ -345,19 +444,32 @@ def main(data_path, info_path):
         
         #! 序列背景点云拼接验证
         # all_points = list(background_points_bank.values())
-        # all_points = np.vstack(all_points)
+        all_points = list(points_bank.values())
+        all_points = np.vstack(all_points)
+        #! 噪音点云二次赋值
+        noise_points_index = np.where(all_points[:, -1] == 0)[0]
+        comfirm_points_index = np.setdiff1d(np.arange(len(all_points)), noise_points_index)
+        noise_points_labels = propagate_labels_with_knn(all_points[comfirm_points_index, :3], all_points[comfirm_points_index, -1], all_points[noise_points_index, :3], distance_threshold=1.5)
+        print(f"{(noise_points_labels!=0).sum()}, {len(noise_points_labels)}")
+        all_points[noise_points_index, -1] = noise_points_labels
+        # colors = generate_35_category_colors(35)
+        # pcd = o3d.geometry.PointCloud()
+        # pcd.points = o3d.utility.Vector3dVector(all_points[:, :3])
+        # pcd.colors = o3d.utility.Vector3dVector(colors[all_points[:, -1].astype(int)])
+        # o3d.io.write_point_cloud(f"./viz/{example['sample_idx']}_all.ply", pcd)
+        #! 地面点二次筛选(patchwork++)
+        # all_points = list(nonground_points_bank.values())
+        # PatchworkPLUSPLUS = pypatchworkpp.patchworkpp(pypatchworkpp.Parameters())
+        # batch_id = np.concatenate([np.full(len(points), i) for i, points in enumerate(all_points)])
+        # all_points_arr = np.vstack(all_points)
+        # PatchworkPLUSPLUS.estimateGround(all_points_arr[:, :4])
+        # nonground_idx = PatchworkPLUSPLUS.getNongroundIndices()
+        # nonground_points = all_points_arr[nonground_idx]
+        # ground_idx = PatchworkPLUSPLUS.getGroundIndices()
+        # batch_id = batch_id[nonground_idx]
+        # all_points = [nonground_points[batch_id == i] for i in range(len(nonground_points_bank))]
+        #! 地面点云区分(seg_gt)
 
-        #! 地面点二次筛选
-        all_points = list(nonground_points_bank.values())
-        PatchworkPLUSPLUS = pypatchworkpp.patchworkpp(pypatchworkpp.Parameters())
-        batch_id = np.concatenate([np.full(len(points), i) for i, points in enumerate(all_points)])
-        all_points_arr = np.vstack(all_points)
-        PatchworkPLUSPLUS.estimateGround(all_points_arr[:, :4])
-        nonground_idx = PatchworkPLUSPLUS.getNongroundIndices()
-        nonground_points = all_points_arr[nonground_idx]
-        ground_idx = PatchworkPLUSPLUS.getGroundIndices()
-        batch_id = batch_id[nonground_idx]
-        all_points = [nonground_points[batch_id == i] for i in range(len(nonground_points_bank))]
         #! 背景非地面点云mesh重建
         nonground_mesh = get_mesh(all_points)
         

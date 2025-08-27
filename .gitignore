@@ -4,3 +4,9 @@ cache
 results
 .vscode
 runs/
+**/*/build
+**/*/dist
+**/*/*.egg-info
+**/*/__pycache__/
+
+

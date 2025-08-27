@@ -10,63 +10,30 @@ from tqdm.contrib.concurrent import thread_map
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 
-
-import vdbfusion
+import torch
 import open3d as o3d
 import numpy as np
 from scipy import stats
 from torch.utils.data import Dataset
 from nuscenes import NuScenes
 from mmcv import load as mmcv_load
-from mmdet3d.datasets import build_dataset
+from mmdet3d.datasets import build_dataset, DATASETS
 from mmcv import track_iter_progress
-from mmdet3d.datasets import DATASETS
 from mmdet3d.datasets.custom_3d import Custom3DDataset
 from mmcv.utils import Registry, build_from_cfg
-from mmdet3d.core.bbox import get_box_type
-from mmdet3d.core.bbox import LiDARInstance3DBoxes
+from mmdet3d.core.bbox import LiDARInstance3DBoxes, get_box_type, box_np_ops
 from mmdet3d.datasets.pipelines import Compose
-from mmdet3d.core.bbox import box_np_ops
+from numba import njit, prange
+
+import vdbfusion
 import pypatchworkpp
 
 from ops.mmdetection3d.tools.misc.browse_dataset import show_det_data, show_result
-from utils.ops import generate_35_category_colors, rotate_yaw
+from utils.ops import generate_35_category_colors, rotate_yaw, viz_mesh, viz_occ
+from utils.ray_operation import ray_casting
+from utils.nuScenes_infos import *
 
-
-NUSC_SEG_MAP = {
-    0: "noise",
-    1: "animal",
-    2: "human.pedestrian.adult",
-    3: "human.pedestrian.child",
-    4: "human.pedestrian.construction_worker",
-    5: "human.pedestrian.personal_mobility",
-    6: "human.pedestrian.police_officer",
-    7: "human.pedestrian.stroller",
-    8: "human.pedestrian.wheelchair",
-    9: "movable_object.barrier",
-    10: "movable_object.debris",
-    11: "movable_object.pushable_pullable",
-    12: "movable_object.trafficcone",
-    13: "static_object.bicycle_rack",
-    14: "vehicle.bicycle",
-    15: "vehicle.bus.bendy",
-    16: "vehicle.bus.rigid",
-    17: "vehicle.car",
-    18: "vehicle.construction",
-    19: "vehicle.emergency.ambulance",
-    20: "vehicle.emergency.police",
-    21: "vehicle.motorcycle",
-    22: "vehicle.trailer",
-    23: "vehicle.truck",
-    24: "flat.driveable_surface",
-    25: "flat.other",
-    26: "flat.sidewalk",
-    27: "flat.terrain",
-    28: "static.manmade",
-    29: "static.other",
-    30: "static.vegetation",
-    31: "vehicle.ego",
-}
+# import ray_casting_cuda
 
 
 class LiDARInstance3DBoxeswithID(LiDARInstance3DBoxes):
@@ -120,6 +87,7 @@ class SequenceDataset(Dataset):
         self.key_frame_index = self.get_key_frame_index()
         self.timestamps = np.array([info["timestamp"] for info in self.data_infos])
 
+        self.fineidx2coarseidx = np.vectorize(NUSC_FINEIDX2COARSEIDX.get)
         if pipeline is not None:
             self.pipeline = Compose(pipeline)
 
@@ -133,14 +101,13 @@ class SequenceDataset(Dataset):
         ).transformation_matrix
         ego2global[:3, 3] = self.data_infos[index]["ego2global_translation"]
         return ego2global
-    
+
     def get_lidar2ego(self, index):
         lidar2ego = pyquaternion.Quaternion(
             self.data_infos[index]["lidar2ego_rotation"]
         ).transformation_matrix
         lidar2ego[:3, 3] = self.data_infos[index]["lidar2ego_translation"]
         return lidar2ego
-    
 
     def get_key_frame_index(self):
 
@@ -238,6 +205,7 @@ class SequenceDataset(Dataset):
             gt_pts_semantic_mask = np.fromfile(
                 info["pts_semantic_mask_path"], dtype=np.uint8
             )
+            gt_pts_semantic_mask = self.fineidx2coarseidx(gt_pts_semantic_mask)
         else:
             gt_pts_semantic_mask = None
         # turn original box type to target box type
@@ -289,7 +257,7 @@ def get_mesh(points, voxel_size=0.1, sdf_trunc=0.3, min_weight=0):
     vdb_volume = vdbfusion.VDBVolume(
         voxel_size=voxel_size, sdf_trunc=sdf_trunc, space_carving=False
     )
-    for i, point in enumerate(tqdm(points)):
+    for i, point in enumerate(points):
         if len(point) > 0:
             vdb_volume.integrate(point[:, :3].astype(np.float64), np.eye(4))
     vertices, triangles = vdb_volume.extract_triangle_mesh(
@@ -333,9 +301,7 @@ def get_ground_mesh(ground_points, grid_size=5, max_workers=1):
         points_ = ground_points[np.array(ground_points2grid_map[(x_, y_)])]
         # print(points_.shape)
         ground_pcd = o3d.geometry.PointCloud()
-        ground_pcd.points = o3d.utility.Vector3dVector(
-            points_[:, :3]
-        ) 
+        ground_pcd.points = o3d.utility.Vector3dVector(points_[:, :3])
         ground_pcd.estimate_normals()
         (
             ground_mesh,
@@ -357,10 +323,19 @@ def get_ground_mesh(ground_points, grid_size=5, max_workers=1):
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         ret = []
         for i in range(len(region_grid)):
-            ret.append(executor.submit(thread_worker, i, region_grid=region_grid, ground_points2grid_map=ground_points2grid_map, points=ground_points))
+            ret.append(
+                executor.submit(
+                    thread_worker,
+                    i,
+                    region_grid=region_grid,
+                    ground_points2grid_map=ground_points2grid_map,
+                    points=ground_points,
+                )
+            )
     # ret = thread_map(thread_func, range(len(region_grid)), max_workers=1, chunksize=20)
 
     return [m for m in ret if m is not None]
+
 
 def propagate_labels_with_knn(
     keyframe_points, keyframe_labels, non_keyframe_points, k=5, distance_threshold=0.5
@@ -407,275 +382,472 @@ def propagate_labels_with_knn(
     return non_keyframe_labels
 
 
-def main(data_path, info_path):
+def fine2coarseidx(fine_name):
+    coarse_name = NUSC_FINE2COARSE[fine_name]
+    coarse_idx = NUSC_COARSE2IDX[coarse_name]
+    return coarse_idx
 
-    dataset = SeqNuscene(data_path, info_path, nuscenes_version="v1.0-mini")
-    colors = generate_35_category_colors(35)
 
-    for i in track_iter_progress(list(range(len(dataset)))):
-        seq_dataset = dataset[i]
-        obj_points_bank = {}
+class Nuscenes2Occ3D:
+    def __init__(self, nuscenes_version="v1.0-mini"):
+        pass
+        self.get_mesh_sample = False
+        self.colors = generate_35_category_colors(35)
+        self.pc_range = np.array([40, 40, 5.4, -40, -40, -1])
+        self.voxel_size = 0.4
+        self.load_offline = True
+        # self.coarse2idx = np.vectorize(NUSC_COARSE2IDX.get)
+
+    def main(self, data_path, info_path):
+        self.dataset = SeqNuscene(data_path, info_path, nuscenes_version="v1.0-mini")
+        for i in track_iter_progress(list(range(len(self.dataset)))):
+            self.seq_run(i)
+
+    def seq_run(self, seq_id):
+        # self.dataset = SeqNuscene(data_path, info_path, nuscenes_version="v1.0-mini")
+        # for i in track_iter_progress(list(range(len(self.dataset)))):
+        self.seq_dataset = self.dataset[seq_id]
+        self.obj_points_bank = {}
+        self.obj_info_bank = {}
+        self.timestamp2token = {}
         # ground_points_bank = {}
         # nonground_points_bank = {}
-        background_points_bank = {}
-        frame_info_bank = {}
-        key_frame_indices = seq_dataset.key_frame_index
-        timestamps = seq_dataset.timestamps
-        key_frame_timestamps = timestamps[key_frame_indices]
-        waiting_for_key_frame = defaultdict(list)
-        for j in track_iter_progress(list(range(len(seq_dataset)))):
-            input_dict = seq_dataset.get_data_info(j)
-            seq_dataset.pre_pipeline(input_dict)
-            example = seq_dataset.pipeline(input_dict)
-            annos = example["ann_info"]
-            timestamp = example["timestamp"]
-            image_idx = example["sample_idx"]
-            frame_info_bank[timestamp] = {"lidar2start": annos["axis_align_matrix"], "lidar2ego": example["lidar2ego"]}
-            points = example["points"].tensor.numpy()
-            gt_pts_semantic_mask = annos["gt_pts_semantic_mask"]  #!(n, )
-            if gt_pts_semantic_mask is None:
-                gt_pts_semantic_mask = np.zeros(len(points), dtype=np.uint8)
-            points = np.concatenate((points, gt_pts_semantic_mask[:, None]), axis=1)
-            gt_boxes_3d = annos["gt_bboxes_3d"].tensor
-            names = annos["gt_names"]
-            gt_boxes_id = annos["gt_bboxes_id"]
-            obj_point_indices = box_np_ops.points_in_rbbox(points, gt_boxes_3d.numpy())
+        self.background_points_bank = {}
+        self.frame_info_bank = {}
+        self.key_frame_indices = self.seq_dataset.key_frame_index
+        self.timestamps = self.seq_dataset.timestamps
+        self.key_frame_timestamps = self.timestamps[self.key_frame_indices]
+        self.waiting_for_key_frame = defaultdict(list)
+        if self.load_offline:
+            self.save_and_load_offline()
+        else:
+            for j in track_iter_progress(list(range(len(self.seq_dataset)))):
+                self.get_frame_data(j)
 
-            #! 区分地面/非地面, 前景(标注目标)/背景点云
-            background_points_indices = np.where(~obj_point_indices.any(axis=1))[0]
-            ground_points_indices = example["ground_idx"]
-            nonground_points_indices = example["nonground_idx"]
-            background_and_ground_points_indices = np.intersect1d(
-                ground_points_indices, background_points_indices, assume_unique=True
+        # self.sample_dynamic_objects()
+
+        all_points = list(self.background_points_bank.values())
+        all_points_arr = np.vstack(all_points)
+        all_points_arr = self.filter_noise(all_points_arr)
+        batch_id = np.concatenate(
+            [
+                np.full(len(points), i)
+                for i, points in enumerate(list(self.background_points_bank.values()))
+            ]
+        )
+
+        #! 先采样再重建
+        if self.get_mesh_sample:
+            mesh_points = self.mesh_and_sample(all_points_arr)
+
+        #! 还原至单帧自车坐标系
+        self.get_key_frame_data(all_points_arr, batch_id)
+
+    def save_and_load_offline(
+        self,
+    ):
+        print("\nloading offline data……")
+        keys = [
+            "obj_points_bank",
+            "obj_info_bank",
+            "timestamp2token",
+            "background_points_bank",
+            "frame_info_bank",
+        ]
+        # for key in keys:
+        #     with open(f"viz/{key}.pkl", "wb") as f:
+        #         pickle.dump(getattr(self, key), f)
+        for k in keys:
+            with open(f"viz/{k}.pkl", "rb") as f:
+                info = pickle.load(f)
+                setattr(self, k, info)
+
+    def put_dynamic_objects(self, timestamp):
+        frame_obj_points = []
+        for obj_info in self.obj_info_bank[timestamp]:
+            obj_id = obj_info["obj_id"]
+            box = obj_info["box"]
+
+            raw_points = self.obj_points_bank[obj_id]["points"][:, :3]
+            mesh_points = self.obj_points_bank[obj_id]["sampled_points"]
+            points = np.vstack([raw_points, mesh_points])
+            points_ego = points @ rotate_yaw(box[6]) + box[:3]
+            label = self.obj_points_bank[obj_id]["label"]
+            points = np.concatenate(
+                [points_ego, np.full((len(points), 1), label)], axis=1
             )
-            background_and_nonground_points_indices = np.intersect1d(
-                nonground_points_indices, background_points_indices, assume_unique=True
+            frame_obj_points.append(points)
+
+        return np.concatenate(frame_obj_points, axis=0)
+
+    def get_key_frame_data(self, all_points_arr, batch_id):
+        root = "/media/chen/data/OpenOcc/Occpancy3D/gts/scene-0061"
+        all_coords = []
+        #! 获取序列下的自车坐标
+        lidars2start = np.array(
+            [i["lidar2start"] for i in self.frame_info_bank.values()]
+        )
+        lidars2egos = np.array([i["lidar2ego"] for i in self.frame_info_bank.values()])
+        spatial_shape = (self.pc_range[:3] - self.pc_range[3:]) / self.voxel_size
+
+        for i, timestamp in enumerate(tqdm(self.key_frame_timestamps)):
+
+            lidar2start = self.frame_info_bank[timestamp]["lidar2start"]
+            lidar2ego = self.frame_info_bank[timestamp]["lidar2ego"]
+
+            ego2cars = (
+                lidars2egos
+                @ np.linalg.inv(lidars2start)
+                @ lidar2start
+                @ np.linalg.inv(lidar2ego)
             )
-            # points_bank[timestamp] = points[background_points_indices]
+            #! 获取当前帧下的序列轨迹坐标点
+            trajectory_pose = np.linalg.inv(ego2cars)[:, :3, -1]
+            points_origin = trajectory_pose[batch_id]  #! broadcast yyds
 
-            # left_points = example['points'][ground_points_indices]
-            # left_points = points[background_points_indices]
-            # nonground_points_bank[example['timestamp']] =  points[background_and_nonground_points_indices]
-            # ground_points_bank[example['timestamp']] = points[background_and_ground_points_indices]
+            local_points = all_points_arr[:, [0, 1, 2, -1]].copy()
+            local_points[:, :3] = (
+                local_points[:, :3] - lidar2start[:3, 3]
+            ) @ lidar2start[
+                :3, :3
+            ]  #! at lidar coordinate
+            local_points[:, :3] = (
+                local_points[:, :3] @ lidar2ego[:3, :3].T + lidar2ego[:3, 3]
+            )
+            # dynamic_points = self.put_dynamic_objects(timestamp)
+            # local_points = np.concatenate([local_points, dynamic_points], axis=0)
+            # todo:范围需要二次确认后统一： 范围确认无误，但在体素化时，需要转到第一象限进行操作以确保【取整】的一致性
+            # range_mask = np.logical_and.reduce([np.abs(local_points[:, 0]) < 40, np.abs(local_points[:, 1]) < 40, local_points[:, 2] > -1, local_points[:, 2] < 5.4])
+            range_mask = np.logical_and.reduce(
+                [
+                    local_points[:, 0] < self.pc_range[0],
+                    local_points[:, 1] < self.pc_range[1],
+                    local_points[:, 2] < self.pc_range[2],
+                    local_points[:, 0] > self.pc_range[3],
+                    local_points[:, 1] > self.pc_range[4],
+                    local_points[:, 2] > self.pc_range[5],
+                ]
+            )
 
-            if not example["is_key_frame"]:
-                closed_key_frame_idx = np.argmin(
-                    np.abs(key_frame_timestamps - timestamp)
+            local_points = local_points[range_mask]
+            points_origin = points_origin[range_mask]
+
+            # viz_occ(local_points[:, :3], local_points[:, -1], name=str(timestamp))
+
+            voxel_coords_, voxel_labels_, voxel_dict = assign_voxel_labels_vectorized(
+                local_points[:, :3],
+                local_points[:, -1],
+                voxel_size=self.voxel_size,
+                pc_range=self.pc_range,
+            )
+            # voxel_points = ((voxel_coords_ - self.pc_range[3:]) / self.voxel_size - 0.5).astype(int)
+            # voxel_free_count = np.zeros(spatial_shape.astype(int), dtype=np.int32)
+
+            free_voxels = ray_casting(
+                local_points,
+                points_origin,
+                np.array(self.pc_range)[3:],
+                np.array([self.voxel_size, self.voxel_size, self.voxel_size]),
+                spatial_shape,
+            )
+            # voxel_free_count = calculate_lidar_visibility(points_origin, local_points, pc_range=self.pc_range, voxel_size=self.voxel_size, spatial_shape=spatial_shape.astype(int), voxel_free_count=voxel_free_count)
+
+            viz_occ(
+                voxel_coords_,
+                voxel_labels_,
+                name=str(timestamp),
+                viz=False,
+                voxel_size=self.voxel_size,
+            )
+
+            occ_gt_path = f"{root}/{self.timestamp2token[timestamp]}/labels.npz"
+            occ_gt = np.load(occ_gt_path)["semantics"].reshape(-1)
+            x = np.arange(-40, 40, self.voxel_size) + self.voxel_size / 2
+            y = np.arange(-40, 40, self.voxel_size) + self.voxel_size / 2
+            z = np.arange(-1, 5.4, self.voxel_size) + self.voxel_size / 2
+            grid_x, grid_y, grid_z = np.meshgrid(x, y, z, indexing="ij")
+            coords = np.stack([grid_x, grid_y, grid_z], axis=-1)
+            coords = coords.reshape(-1, 3)
+            mask = occ_gt != 17
+            viz_occ(
+                coords[mask],
+                occ_gt[mask],
+                name=f"{timestamp}-gt",
+                viz=False,
+                voxel_size=self.voxel_size,
+            )
+            coords = (coords - lidar2ego[:3, 3]) @ lidar2ego[:3, :3] @ lidar2start[
+                :3, :3
+            ].T + lidar2start[:3, 3]
+
+            all_coords.append(
+                np.concatenate([coords, occ_gt.reshape(-1, 1)], axis=-1)[mask]
+            )
+        all_coords = np.concatenate(all_coords, axis=0)
+        self.viz_points(all_coords)
+
+    def sample_dynamic_objects(
+        self,
+    ):
+
+        for obj_id, data in self.obj_points_bank.items():
+            points = data["points"]
+            if sum([len(i) for i in points]) == 0:
+                self.obj_points_bank[obj_id]["sampled_points"] = np.zeros((0, 3))
+                continue
+            gt_box = np.zeros((1, 7))
+            gt_box[0, 3:6] = data["size"]
+            #! mesh 重建
+            mesh = get_mesh(points)
+            # viz_mesh(mesh, gt_box.copy(), save=True)
+            #! 原始点云体素化
+            viz_points = np.vstack(points)
+            mesh_points = o3d.geometry.PointCloud()
+            mesh_points.points = o3d.utility.Vector3dVector(viz_points[:, :3])
+            voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(
+                mesh_points, voxel_size=0.05
+            )
+            # viz_mesh(voxel_grid, gt_box.copy(), save=False)
+
+            # 原始点云
+            # show_result(
+            #     points=viz_points,
+            #     gt_bboxes=gt_box.copy(),
+            #     pred_bboxes=None,
+            #     out_dir="./viz",
+            #     filename=obj_id,
+            #     show=True,
+            #     snapshot=True,
+            # )
+
+            mesh_points = mesh.sample_points_poisson_disk(len(viz_points) * 2)
+            points = np.asarray(mesh_points.points)
+            points = points[
+                np.logical_and.reduce(
+                    [
+                        points[:, 0] >= -gt_box[0, 3] / 2,
+                        points[:, 0] <= gt_box[0, 3] / 2,
+                        points[:, 1] >= -gt_box[0, 4] / 2,
+                        points[:, 1] <= gt_box[0, 4] / 2,
+                        points[:, 2] >= 0,
+                        points[:, 2] <= gt_box[0, 5],
+                    ]
                 )
-                keyframe_timesamp = key_frame_timestamps[closed_key_frame_idx]
+            ]
+            # mesh_points.points = o3d.utility.Vector3dVector(
+            #     np.vstack((points, viz_points[:, :3]))
+            # )
+            self.obj_points_bank[obj_id]["sampled_points"] = points
+            # voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(
+            #     mesh_points, voxel_size=0.05
+            # )
 
-                if keyframe_timesamp not in background_points_bank:
-                    waiting_for_key_frame[keyframe_timesamp].append(timestamp)
-                else:
-                    # keyframe_timesamp = key_frame_timestamps[closed_key_frame_idx]
-                    # keyframe_points = np.concatenate((nonground_points_bank[keyframe_timesamp], ground_points_bank[keyframe_timesamp]))
-                    keyframe_points = background_points_bank[keyframe_timesamp]
-                    keyframe_labels = keyframe_points[:, -1]
-                    labels = propagate_labels_with_knn(
-                        keyframe_points[:, :3], keyframe_labels, points[:, :3]
-                    )
-                    points[:, -1] = labels
-            elif timestamp in waiting_for_key_frame:
-                non_key_frames = waiting_for_key_frame.pop(timestamp)
-                for non_key_frames_timestamp in non_key_frames:
-                    non_keyframe_points = background_points_bank[non_key_frames_timestamp]
-                    non_keyframe_labels = propagate_labels_with_knn(
-                        points[background_points_indices, :3],
-                        points[background_points_indices, -1],
-                        non_keyframe_points[:, :3],
-                    )
-                    background_points_bank[non_key_frames_timestamp][:, -1] = non_keyframe_labels
+            # mesh点云+原始点云
+            # viz_points = np.asarray(mesh_points.points)
+            # show_result(
+            #     points=viz_points,
+            #     gt_bboxes=gt_box.copy(),
+            #     pred_bboxes=None,
+            #     out_dir="./viz",
+            #     filename=obj_id,
+            #     show=True,
+            #     snapshot=True,
+            # )
+            # (mesh点云+原始点云i)mesh重建
+            # viz_mesh(voxel_grid, gt_box.copy(), save=False)
 
-            background_points_bank[timestamp] = points[background_points_indices]
+            # mesh = get_mesh([viz_points, ])
+            # viz_mesh(mesh, gt_box.copy(), save=True)
 
-            # show_result(points=points, gt_bboxes=gt_boxes_3d.clone(), pred_bboxes=None, out_dir="./viz", filename=example['sample_idx'], show=True, snapshot=True)
-
-            for i, (obj_id, box) in enumerate(zip(gt_boxes_id, gt_boxes_3d.numpy())):
-                if obj_id not in obj_points_bank:
-                    obj_points_bank[obj_id] = {"points": [], "size": box[3:6]}
-                gt_points = points[obj_point_indices[:, i]]
-                gt_points[:, :3] -= box[:3]
-                gt_points[:, :3] = gt_points[:, :3] @ rotate_yaw(box[6]).T
-                obj_points_bank[obj_id]["points"].append(gt_points)
-                obj_points_bank[obj_id]["size"] = np.maximum(
-                    obj_points_bank[obj_id]["size"], box[3:6]
-                )
-
-        #! 序列背景点云拼接验证
-        all_points = list(background_points_bank.values())
-        all_points = np.vstack(all_points)
-        #! 噪音点云二次赋值
-        noise_points_index = np.where(all_points[:, -1] == 0)[0]
+    def filter_noise(self, all_points_arr):
+        """噪音点云二次赋值"""
+        noise_points_index = np.where(all_points_arr[:, -1] == 0)[0]
         comfirm_points_index = np.setdiff1d(
-            np.arange(len(all_points)), noise_points_index
+            np.arange(len(all_points_arr)), noise_points_index
         )
         noise_points_labels = propagate_labels_with_knn(
-            all_points[comfirm_points_index, :3],
-            all_points[comfirm_points_index, -1],
-            all_points[noise_points_index, :3],
+            all_points_arr[comfirm_points_index, :3],
+            all_points_arr[comfirm_points_index, -1],
+            all_points_arr[noise_points_index, :3],
             distance_threshold=1.5,
         )
-        # print(f"{(noise_points_labels!=0).sum()}, {len(noise_points_labels)}")
-        all_points[noise_points_index, -1] = noise_points_labels
-        batch_id = np.concatenate([np.full(len(points), i) for i, points in enumerate(list(background_points_bank.values()))])
-        # #! 对拼接赋值后的点云直接进行体素化
-        # for i, timestamp in enumerate(tqdm(key_frame_timestamps)):
-            
-        #     lidar2start = frame_info_bank[timestamp]["lidar2start"]
-        #     lidar2ego = frame_info_bank[timestamp]["lidar2ego"]
+        all_points_arr[noise_points_index, -1] = noise_points_labels
 
-        #     local_points = all_points.copy()
-        #     # local_points[:, :3] = (local_points[:, :3]) @ ego2start[:3, :3].T + ego2start[:3, 3]
-        #     local_points[:, :3] = (local_points[:, :3] - lidar2start[:3, 3]) @ lidar2start[:3, :3] #! at lidar coordinate
-        #     local_points[:, :3] = local_points[:, :3] @ lidar2ego[:3, :3].T + lidar2ego[:3, 3]
-        #     range_mask = np.logical_and.reduce([np.abs(local_points[:, 0]) <= 40, np.abs(local_points[:, 1]) <= 40, local_points[:, 2] > -1.4, local_points[:, 2] < 5.8])
-        #     # range_mask = np.logical_and.reduce([np.abs(local_points[:, 0]) <= 40, np.abs(local_points[:, 1]) <= 40])
-        #     local_points = local_points[range_mask]
-        #     voxel_coords_, voxel_labels_ = assign_voxel_labels_vectorized(local_points[:,:3], local_points[:, -1], voxel_size=0.4)
-        #     viz_occ(voxel_coords_, voxel_labels_, name=str(timestamp))
-        # #! 全部背景点云可视化
-        # pcd = o3d.geometry.PointCloud()
-        # pcd.points = o3d.utility.Vector3dVector(all_points[:, :3])
-        # pcd.colors = o3d.utility.Vector3dVector(colors[all_points[:,-1].astype(int)])
-        # o3d.io.write_triangle_mesh(f"./viz/{obj_id}.ply", mesh)
-        # #! 全部背景点云栅格化后可视化
-        # voxel_coords, voxel_labels = assign_voxel_labels_vectorized(all_points[:,:3], all_points[:, -1], voxel_size=0.4)
-        # pcd = o3d.geometry.PointCloud()
-        # pcd.points = o3d.utility.Vector3dVector(voxel_coords)
-        # pcd.colors = o3d.utility.Vector3dVector(colors[voxel_labels.astype(int)])
-        # o3d.io.write_point_cloud(f"./viz/occ_{example['sample_idx']}_all.ply", pcd)
-        #! 地面点二次筛选(patchwork++)
-        # all_points = list(nonground_points_bank.values())
-        # PatchworkPLUSPLUS = pypatchworkpp.patchworkpp(pypatchworkpp.Parameters())
-        # batch_id = np.concatenate([np.full(len(points), i) for i, points in enumerate(all_points)])
-        # all_points_arr = np.vstack(all_points)
-        # PatchworkPLUSPLUS.estimateGround(all_points_arr[:, :4])
-        # nonground_idx = PatchworkPLUSPLUS.getNongroundIndices()
-        # nonground_points = all_points_arr[nonground_idx]
-        # ground_idx = PatchworkPLUSPLUS.getGroundIndices()
-        # batch_id = batch_id[nonground_idx]
-        # all_points = [nonground_points[batch_id == i] for i in range(len(nonground_points_bank))]
-        #!!! 暂时不区分地面非地面！！！
-        # #! 地面点云区分(seg_gt)
-        # ground_point_mask = np.isin(all_points[:, -1], [24,25,26,27])
-        # ground_point_indices = np.where(ground_point_mask)[0]
-        # ground_points = all_points[ground_point_indices]
-        # ground_mesh = get_ground_mesh(ground_points)
-        # viz_mesh(ground_mesh)
-        # #! 背景非地面点云mesh重建
-        # nonground_point_indices = np.where(~ground_point_mask)[0]
-        # nonground_points = all_points[nonground_point_indices]
-        
-        # nonground_mesh = get_mesh([nonground_points])
-        # viz_mesh(nonground_mesh)
-        # ground_points = list(ground_points_bank.values())
-        # ground_points = np.vstack(ground_points)
-        # ground_points = np.concatenate((ground_points, all_points_arr[ground_idx]))
-        # ground_mesh = get_ground_mesh(ground_points)
-        # viz_mesh(ground_mesh)
-        # for obj_id, data in obj_points_bank.items():
-        #     points = data['points']
-        #     size = data['size']
-        #     mesh = get_mesh(points)
-        #     # points = np.vstack(points)
-        #     show_result(points=np.vstack(points), gt_bboxes=None, pred_bboxes=None, out_dir="./viz", filename=example['sample_idx'], show=True, snapshot=True)
-        #     o3d.visualization.draw_geometries([mesh])
-        #     o3d.io.write_triangle_mesh(f"./viz/{obj_id}.ply", mesh)
-        #! 全部背景点云mesh重建， 直接全部点云输入对泊松盘采样计算量过大！ 按照类别分块处理
-        sample_points = []
-        for cat_id in range(1, 35):
-            cat_points = all_points[all_points[:, -1] == cat_id]
-            cat_mesh = get_mesh([cat_points])
-            cat_mesh_pcd = cat_mesh.sample_points_poisson_disk(len(cat_points))
-            cat_mesh_points = np.asarray(cat_mesh_pcd.points)
-            sample_points.append(np.concatenate([cat_mesh_points, np.full(len(cat_mesh_points), cat_id).reshape(-1, 1)], axis=-1))
-            print(f"cat_id:{cat_id}, {len(cat_points)} -> {len(cat_mesh_points)}")
+        return all_points_arr
 
-        # scene_mesh = get_mesh([all_points])
+    def mesh_and_sample(self, all_points_arr):
+        sample_points, sample_labels = assign_voxel_labels_vectorized(
+            all_points_arr[:, :3], all_points_arr[:, -1], voxel_size=0.01
+        )
+        scene_mesh = get_mesh([sample_points])
         # # viz_mesh(scene_mesh, save=True)
-        # mesh_pcd = scene_mesh.sample_points_poisson_disk(len(all_points))
-        # mesh_points = np.asarray(mesh_pcd.points)
-        # mesh_point_labels = propagate_labels_with_knn(all_points[:, :3], all_points[:, -1], mesh_points, distance_threshold=0.5)
-        # mesh_points = np.concatenate([mesh_points, mesh_point_labels.reshape(-1, 1)], axis=-1)
+        mesh_pcd = scene_mesh.sample_points_poisson_disk(len(all_points_arr))
+        mesh_points = np.asarray(mesh_pcd.points)
+        mesh_point_labels = propagate_labels_with_knn(
+            all_points_arr[:, :3],
+            all_points_arr[:, -1],
+            mesh_points,
+            distance_threshold=0.5,
+        )
+        mesh_points = np.concatenate(
+            [mesh_points, mesh_point_labels.reshape(-1, 1)], axis=-1
+        )
 
-def assign_voxel_labels_vectorized(points, labels, voxel_size=0.05):
+        return mesh_points
+
+    def viz_points(self, all_points, obj_id="tmp"):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(all_points[:, :3])
+        pcd.colors = o3d.utility.Vector3dVector(
+            self.colors[all_points[:, -1].astype(int)]
+        )
+        o3d.io.write_point_cloud(f"./viz/{obj_id}.ply", pcd)
+
+    def get_frame_data(self, index):
+        input_dict = self.seq_dataset.get_data_info(index)
+        self.seq_dataset.pre_pipeline(input_dict)
+        example = self.seq_dataset.pipeline(input_dict)
+        annos = example["ann_info"]
+        timestamp = example["timestamp"]
+        image_idx = example["sample_idx"]
+
+        self.timestamp2token[timestamp] = image_idx
+        self.frame_info_bank[timestamp] = {
+            "lidar2start": annos["axis_align_matrix"],
+            "lidar2ego": example["lidar2ego"],
+        }
+        points = example["points"].tensor.numpy()[:, :3]  #! (n, 3)
+        gt_pts_semantic_mask = annos["gt_pts_semantic_mask"]  #!(n, )
+
+        if gt_pts_semantic_mask is None:
+            gt_pts_semantic_mask = np.zeros(len(points), dtype=np.uint8)
+        points = np.concatenate((points, gt_pts_semantic_mask[:, None]), axis=1)
+        gt_boxes_3d = annos["gt_bboxes_3d"].tensor
+        names = annos["gt_names"]
+        gt_boxes_id = annos["gt_bboxes_id"]
+        obj_point_indices = box_np_ops.points_in_rbbox(points, gt_boxes_3d.numpy())
+
+        #! 区分地面/非地面, 前景(标注目标)/背景点云
+        background_points_indices = np.where(~obj_point_indices.any(axis=1))[0]
+        ground_points_indices = example["ground_idx"]
+        nonground_points_indices = example["nonground_idx"]
+        background_and_ground_points_indices = np.intersect1d(
+            ground_points_indices, background_points_indices, assume_unique=True
+        )
+        background_and_nonground_points_indices = np.intersect1d(
+            nonground_points_indices, background_points_indices, assume_unique=True
+        )
+        # points_bank[timestamp] = points[background_points_indices]
+
+        # left_points = example['points'][ground_points_indices]
+        # left_points = points[background_points_indices]
+        # nonground_points_bank[example['timestamp']] =  points[background_and_nonground_points_indices]
+        # ground_points_bank[example['timestamp']] = points[background_and_ground_points_indices]
+
+        if not example["is_key_frame"]:
+            closed_key_frame_idx = np.argmin(
+                np.abs(self.key_frame_timestamps - timestamp)
+            )
+            keyframe_timesamp = self.key_frame_timestamps[closed_key_frame_idx]
+
+            if keyframe_timesamp not in self.background_points_bank:
+                self.waiting_for_key_frame[keyframe_timesamp].append(timestamp)
+            else:
+                # keyframe_timesamp = key_frame_timestamps[closed_key_frame_idx]
+                # keyframe_points = np.concatenate((nonground_points_bank[keyframe_timesamp], ground_points_bank[keyframe_timesamp]))
+                keyframe_points = self.background_points_bank[keyframe_timesamp]
+                keyframe_labels = keyframe_points[:, -1]
+                labels = propagate_labels_with_knn(
+                    keyframe_points[:, :3], keyframe_labels, points[:, :3]
+                )
+                points[:, -1] = labels
+        elif timestamp in self.waiting_for_key_frame:
+            non_key_frames = self.waiting_for_key_frame.pop(timestamp)
+            for non_key_frames_timestamp in non_key_frames:
+                non_keyframe_points = self.background_points_bank[
+                    non_key_frames_timestamp
+                ]
+                non_keyframe_labels = propagate_labels_with_knn(
+                    points[background_points_indices, :3],
+                    points[background_points_indices, -1],
+                    non_keyframe_points[:, :3],
+                )
+                self.background_points_bank[non_key_frames_timestamp][
+                    :, -1
+                ] = non_keyframe_labels
+
+        self.background_points_bank[timestamp] = points[background_points_indices]
+
+        # show_result(points=points, gt_bboxes=gt_boxes_3d.clone(), pred_bboxes=None, out_dir="./viz", filename=example['sample_idx'], show=True, snapshot=True)
+        self.obj_info_bank[timestamp] = []
+        for i, (obj_id, box) in enumerate(zip(gt_boxes_id, gt_boxes_3d.numpy())):
+            self.obj_info_bank[timestamp].append({"obj_id": obj_id, "box": box})
+            if obj_id not in self.obj_points_bank:
+                self.obj_points_bank[obj_id] = {
+                    "points": [],
+                    "size": box[3:6],
+                    "label": NUSC_COARSE2IDX[NUSC_FINE2COARSE.get(names[i], names[i])],
+                }
+            gt_points = points[obj_point_indices[:, i]]
+            gt_points[:, :3] -= box[:3]
+            gt_points[:, :3] = gt_points[:, :3] @ rotate_yaw(box[6]).T
+            self.obj_points_bank[obj_id]["points"].append(gt_points)
+            self.obj_points_bank[obj_id]["size"] = np.maximum(
+                self.obj_points_bank[obj_id]["size"], box[3:6]
+            )
+        return
+
+
+def assign_voxel_labels_vectorized(
+    points, labels, voxel_size=0.05, pc_range=[40, 40, 5.4, -40, -40, -1]
+):
     """
     使用向量化操作高效地为体素分配标签
-    
+
     参数:
     points: 点云坐标 (N, 3)
     labels: 点云分割标签 (N,)
     voxel_size: 体素大小
-    
+
     返回:
     voxel_coords: 体素中心坐标 (M, 3)
     voxel_labels: 体素标签 (M,)
     """
     # 计算每个点所在的体素索引
-    voxel_indices = np.floor(points / voxel_size).astype(int)
+    zero_point = points - np.array(pc_range[3:])
+    voxel_indices = np.floor(zero_point / voxel_size).astype(int)
     # 使用字典存储每个体素中的标签
     voxel_dict = defaultdict(list)
     # 将每个点的标签添加到对应体素的列表中
     for i, idx in enumerate(voxel_indices):
         voxel_key = tuple(idx)
-        voxel_dict[voxel_key].append(labels[i])
+        voxel_dict[voxel_key].append(i)
+        # voxel_dict[voxel_key].append(labels[i])
     # 提取体素坐标和标签
     voxel_coords = []
     voxel_labels = []
-    for voxel_key, label_list in voxel_dict.items():
+    # voxel_counts = []
+    for voxel_key, idx_list in voxel_dict.items():
         # 计算体素中心坐标
         center = (np.array(voxel_key) + 0.5) * voxel_size
         voxel_coords.append(center)
         # 使用多数投票确定体素标签
+        label_list = labels[idx_list]
         unique, counts = np.unique(label_list, return_counts=True)
         counts[unique == 0] = -1  # 将背景标签的计数设为-1，使其不会影响多数投票
         voxel_labels.append(unique[np.argmax(counts)])
-    
-    return np.array(voxel_coords), np.array(voxel_labels)
+        # voxel_counts.append(len(label_list))
 
-def viz_mesh(mesh, gt_box=None, save=True):
+    return (
+        np.array(voxel_coords) + np.array(pc_range[3:]),
+        np.array(voxel_labels),
+        dict(voxel_dict),
+    )
 
-    vis = o3d.visualization.Visualizer()
-    vis.create_window()
-    mesh_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-        size=1, origin=[0, 0, 0]
-    )  # create coordinate frame
-    vis.add_geometry(mesh_frame)
-    if isinstance(mesh, list):
-        for m in mesh:
-            vis.add_geometry(m)
-    else:
-        vis.add_geometry(mesh)
-    if gt_box is not None:
-        gt_box[0, 2] += 0.5 * gt_box[0, 5]
-        box3d = o3d.geometry.OrientedBoundingBox(
-            gt_box[0, 0:3], np.eye(3), gt_box[0, 3:6]
-        )
-        line_set = o3d.geometry.LineSet.create_from_oriented_bounding_box(box3d)
-        vis.add_geometry(line_set)
-    vis.run()
-    if save:
-        o3d.io.write_triangle_mesh(f"./viz/tmp.ply", mesh)
-    return
 
-def viz_occ(points, labels, save=True, name="tmp"):
-    vis = o3d.visualization.Visualizer()
-    vis.create_window()
-    mesh_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-        size=1, origin=[0, 0, 0]
-    )  # create coordinate frame
-    vis.add_geometry(mesh_frame)
-    colors = generate_35_category_colors(35)
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
 
-    pcd.colors = o3d.utility.Vector3dVector(colors[labels.astype(int)])
-    voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=0.4)
-    vis.add_geometry(voxel_grid)
-    vis.run()
-    if save:
-        o3d.io.write_voxel_grid(f"./viz/{name}.ply", voxel_grid)
-    return
+
+
 
 if __name__ == "__main__":
     from ops.mmdetection3d.tools.data_converter.nuscenes_converter import (
@@ -686,76 +858,9 @@ if __name__ == "__main__":
     #     # '/media/chen/Elements/nuScenes/raw/Trainval/',
     #     "/media/chen/data/nusecnes/v1.0-mini",
     #     info_prefix="test",
-    #     version='v1.0-mini',
-    #     get_seg=True)
-
-    main("/media/chen/data/nusecnes/v1.0-mini/", "test_infos_train.pkl")
-    obj_points_bank = pickle.load(open("tmp.pkl", "rb"))
-    for obj_id, data in obj_points_bank.items():
-        # if True:
-        # obj_id = "e91afa15647c4c4994f19aeb302c7179"
-        # data = obj_points_bank[obj_id]
-        points = data["points"]
-        gt_box = np.zeros((1, 7))
-        gt_box[0, 3:6] = data["size"]
-        # size = data['size']
-        mesh = get_mesh(points)
-        # mesh 重建
-        viz_mesh(mesh, gt_box.copy(), save=True)
-        # 原始点云体素化
-        viz_points = np.vstack(points)
-        mesh_points = o3d.geometry.PointCloud()
-        mesh_points.points = o3d.utility.Vector3dVector(viz_points[:, :3])
-        voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(
-            mesh_points, voxel_size=0.05
-        )
-        viz_mesh(voxel_grid, gt_box.copy(), save=False)
-
-        # 原始点云
-        show_result(
-            points=viz_points,
-            gt_bboxes=gt_box.copy(),
-            pred_bboxes=None,
-            out_dir="./viz",
-            filename=obj_id,
-            show=True,
-            snapshot=True,
-        )
-
-        mesh_points = mesh.sample_points_poisson_disk(10000)
-        points = np.asarray(mesh_points.points)
-        points = points[
-            np.logical_and.reduce(
-                [
-                    points[:, 0] >= -gt_box[0, 3] / 2,
-                    points[:, 0] <= gt_box[0, 3] / 2,
-                    points[:, 1] >= -gt_box[0, 4] / 2,
-                    points[:, 1] <= gt_box[0, 4] / 2,
-                    points[:, 2] >= 0,
-                    points[:, 2] <= gt_box[0, 5],
-                ]
-            )
-        ]
-        mesh_points.points = o3d.utility.Vector3dVector(
-            np.vstack((points, viz_points[:, :3]))
-        )
-        voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(
-            mesh_points, voxel_size=0.05
-        )
-
-        # mesh点云+原始点云
-        viz_points = np.asarray(mesh_points.points)
-        show_result(
-            points=viz_points,
-            gt_bboxes=gt_box.copy(),
-            pred_bboxes=None,
-            out_dir="./viz",
-            filename=obj_id,
-            show=True,
-            snapshot=True,
-        )
-        # (mesh点云+原始点云i)mesh重建
-        viz_mesh(voxel_grid, gt_box.copy(), save=False)
-
-        # mesh = get_mesh([viz_points, ])
-        # viz_mesh(mesh, gt_box.copy(), save=True)
+    #     version="v1.0-mini",
+    #     get_seg=True,
+    # )
+    nusc2occ = Nuscenes2Occ3D()
+    nusc2occ.main("/media/chen/data/nusecnes/v1.0-mini/", "test_infos_train.pkl")
+    # main("/media/chen/data/nusecnes/v1.0-mini/", "test_infos_train.pkl")

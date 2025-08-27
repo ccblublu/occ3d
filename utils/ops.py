@@ -1,5 +1,6 @@
 import numpy as np
 import colorsys
+import open3d as o3d
 
 def generate_35_category_colors(num):
     """
@@ -43,6 +44,57 @@ def rotate_yaw(yaw):
         [[np.cos(yaw), np.sin(yaw), 0], [-np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]],
         dtype=np.float32,
     )
+
+
+
+
+def viz_occ(points, labels, save=True, viz=True, name="tmp", voxel_size=0.4):
+    colors = generate_35_category_colors(35)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+
+    pcd.colors = o3d.utility.Vector3dVector(colors[labels.astype(int)])
+    voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(
+        pcd, voxel_size=voxel_size
+    )
+    if viz:
+        vis = o3d.visualization.Visualizer()
+        vis.create_window()
+        mesh_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=1, origin=[0, 0, 0]
+        )  # create coordinate frame
+        vis.add_geometry(mesh_frame)
+        vis.add_geometry(voxel_grid)
+        vis.run()
+    if save:
+        o3d.io.write_voxel_grid(f"./viz/{name}.ply", voxel_grid)
+    return pcd
+
+def viz_mesh(mesh, gt_box=None, save=True):
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window()
+    mesh_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+        size=1, origin=[0, 0, 0]
+    )  # create coordinate frame
+    vis.add_geometry(mesh_frame)
+    if isinstance(mesh, list):
+        for m in mesh:
+            vis.add_geometry(m)
+    else:
+        vis.add_geometry(mesh)
+    if gt_box is not None:
+        gt_box[0, 2] += 0.5 * gt_box[0, 5]
+        box3d = o3d.geometry.OrientedBoundingBox(
+            gt_box[0, 0:3], np.eye(3), gt_box[0, 3:6]
+        )
+        line_set = o3d.geometry.LineSet.create_from_oriented_bounding_box(box3d)
+        vis.add_geometry(line_set)
+    vis.run()
+    if save:
+        o3d.io.write_triangle_mesh(f"./viz/tmp.ply", mesh)
+    return
+
 
 if __name__ == '__main__':
     colors = generate_35_category_colors(35)

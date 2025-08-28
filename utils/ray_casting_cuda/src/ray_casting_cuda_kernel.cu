@@ -112,7 +112,7 @@ __global__ void ray_casting_kernel(
         // Check finish
         valid = false;
         for (int k = 0; k < 3; ++k)
-            if (step[k] * (cur_voxel[k] - last_voxel[k]) < 0.5f)
+            if (step[k] * (last_voxel[k] - cur_voxel[k]) > 0.5f)
                 valid = true;
     }
     voxel_nums[idx] = voxel_count;

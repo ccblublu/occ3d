@@ -27,13 +27,15 @@ def ray_casting(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
     # pc_range_min_ = np.array([-40.,-40.,-1.], dtype=np.float32)
     # voxel_size_ = np.array([0.4,0.4,0.4], dtype=np.float32)
     # spatial_shape_ = np.array([200,200,16], dtype=np.int32)
-    # for index in range(10000):
+    # # for index in range(10000):
+    # while True:
+    #     index = 0
     #     ray_start_ = ray_start[index, :3].astype(np.float32)
     #     ray_end_ = ray_end[index, :3].astype(np.float32)
     #     ray_casting_(ray_start_, ray_end_, pc_range_min_, voxel_size_, spatial_shape_)
-    # # 返回单个射线的结果
-    # print('time1:', time.time()-start)
-    # output = [voxel_index[:voxel_num] for voxel_index, voxel_num in zip(voxel_indices, voxel_nums)]
+    # # # 返回单个射线的结果
+    # # print('time1:', time.time()-start)
+    # # output = [voxel_index[:voxel_num] for voxel_index, voxel_num in zip(voxel_indices, voxel_nums)]
     return output
 
 # @njit
@@ -58,7 +60,7 @@ def ray_casting_(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
     # Initialize arrays
     ray = new_ray_end - new_ray_start #! coords: points
     step = np.sign(ray).astype(np.int32)  # Use sign function for step direction
-    # print(step)
+    print(step)
     # Handle zero ray components
     ray_nonzero = np.abs(ray) > 1e-12
     tDelta = np.full(3, 1e10)  # Large value for zero-ray components
@@ -71,11 +73,11 @@ def ray_casting_(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
     new_ray_end -= step * voxel_size * eps
 
     # Calculate current and last voxel indices
-    # print(new_ray_start, new_ray_end)
+    print(new_ray_start, new_ray_end)
 
     cur_voxel = np.floor(new_ray_start.astype(np.float32) / voxel_size).astype(np.int32)
     last_voxel = np.floor(new_ray_end.astype(np.float32) / voxel_size).astype(np.int32)
-    # print(cur_voxel, last_voxel)
+    print(cur_voxel, last_voxel)
 
     # Initialize tMax values
     tMax = np.full(3, 1e10)
@@ -88,7 +90,7 @@ def ray_casting_(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
             else:
                 tMax[k] = cur_coordinate + voxel_size[k] * step[k]
             tMax[k] = (tMax[k] - new_ray_start[k]) / ray[k]
-    while np.any(step * (cur_voxel - last_voxel) < 0.5):#! 沿一个轴走完
+    while np.any(step * (last_voxel - cur_voxel) > 0.5):#! 沿一个轴走完
         # Find the axis with the minimum tMax
         min_axis = np.argmin(tMax)
 

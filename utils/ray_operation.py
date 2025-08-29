@@ -3,14 +3,14 @@ from numba import cuda, float32, int32, njit
 import math
 import torch
 import ray_casting_cuda 
-
+import gc
 
 def ray_casting(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
     # import time
     # start = time.time()
 
-    ray_starts = torch.from_numpy(np.array(ray_start[..., :3])).to(torch.float32).to('cuda')
-    ray_ends = torch.from_numpy(np.array(ray_end[..., :3])).to(torch.float32).to('cuda')
+    ray_starts = torch.from_numpy(np.array(ray_start[..., :3])).to(torch.float32)
+    ray_ends = torch.from_numpy(np.array(ray_end[..., :3])).to(torch.float32)
     pc_range_min = torch.from_numpy(np.array(pc_range_min)).to(torch.float32).to('cuda')
     voxel_size = torch.from_numpy(np.array(voxel_size)).to(torch.float32).to('cuda')
     spatial_shape = torch.from_numpy(np.array(spatial_shape)).to(torch.int32).to('cuda')
@@ -18,8 +18,9 @@ def ray_casting(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
     max_length = 1000000
     output = []
     for i in range(int(np.ceil(ray_starts.shape[0]/max_length))):
-        voxel_indices, voxel_nums = ray_casting_cuda.ray_casting_cuda(ray_starts[i*max_length:(i+1)*max_length], ray_ends[i*max_length:(i+1)*max_length], pc_range_min, voxel_size, spatial_shape.to(torch.int32), max_voxels_per_ray)
+        voxel_indices, voxel_nums = ray_casting_cuda.ray_casting_cuda(ray_starts[i*max_length:(i+1)*max_length].to('cuda'), ray_ends[i*max_length:(i+1)*max_length].to('cuda'), pc_range_min, voxel_size, spatial_shape.to(torch.int32), max_voxels_per_ray)
         result = [voxel_index[:voxel_num].cpu().numpy() for voxel_index, voxel_num in zip(voxel_indices, voxel_nums)]
+        torch.cuda.empty_cache()
         output.extend(result)
     # print('time0:', time.time()-start)
     # voxel_indices, voxel_nums = ray_casting_cuda.ray_casting_cuda(ray_starts, ray_ends, pc_range_min, voxel_size, spatial_shape, max_voxels_per_ray)
@@ -36,6 +37,8 @@ def ray_casting(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
     # # # 返回单个射线的结果
     # # print('time1:', time.time()-start)
     # # output = [voxel_index[:voxel_num] for voxel_index, voxel_num in zip(voxel_indices, voxel_nums)]
+    # torch.cuda.empty_cache()
+    gc.collect()
     return output
 
 # @njit

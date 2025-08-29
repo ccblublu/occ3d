@@ -30,6 +30,11 @@ std::vector<at::Tensor> ray_casting_cuda(
         B,
         stream
     );
+    cudaError_t err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA error: " << cudaGetErrorString(err) << std::endl;
+        throw std::runtime_error("CUDA stream synchronization failed");
+    }
     return {voxel_indices, voxel_nums};
 }
 

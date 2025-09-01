@@ -1,6 +1,7 @@
+from typing import List 
+
 import numpy as np
 from numba import cuda, float32, int32, njit
-import math
 import torch
 import ray_casting_cuda 
 import gc
@@ -111,3 +112,15 @@ def ray_casting_(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
         free_voxel.append(cur_voxel.copy())
 
     return free_voxel
+
+
+@njit(cache=True)
+def camera_ray_occ(free_voxels:List[np.ndarray], lidar_voxel_state:np.ndarray, camera_voxel_state:np.ndarray):
+    for free_voxel in free_voxels:
+        for voxel in free_voxel:
+            if lidar_voxel_state[voxel[0], voxel[1], voxel[2]] == 1:
+                camera_voxel_state[voxel[0], voxel[1], voxel[2]] = 1
+                break
+            else:
+                camera_voxel_state[voxel[0], voxel[1], voxel[2]] = lidar_voxel_state[voxel[0], voxel[1], voxel[2]]
+    return camera_voxel_state

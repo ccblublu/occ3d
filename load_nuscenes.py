@@ -9,6 +9,7 @@ from tqdm import tqdm
 from tqdm.contrib.concurrent import thread_map
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
+from typing import List
 
 import torch
 import imagesize
@@ -31,7 +32,7 @@ import pypatchworkpp
 
 from ops.mmdetection3d.tools.misc.browse_dataset import show_det_data, show_result
 from utils.ops import generate_35_category_colors, rotate_yaw, viz_mesh, viz_occ
-from utils.ray_operation import ray_casting
+from utils.ray_operation import ray_casting, camera_ray_occ
 from utils.nuScenes_infos import *
 
 # import ray_casting_cuda
@@ -586,7 +587,7 @@ class Nuscenes2Occ3D:
             grid_x, grid_y, grid_z = np.meshgrid(x, y, z, indexing="ij")
             coords = np.stack([grid_x, grid_y, grid_z], axis=-1)
             coords = coords.reshape(-1, 3)
-            mask_pred = (voxel_state == 0).reshape(-1)
+            mask_pred = (camera_voxel_state == 0).reshape(-1)
             trajectory_voxel = (trajectory_voxel + 0.5 ) * self.voxel_size + self.pc_range[3:] 
             # with_car_voxel = np.concatenate([coords[mask_pred], trajectory_voxel])
             # with_car_sem = np.concatenate([voxel_state.reshape(-1)[mask_pred], ego_sem], dtype=np.int32)
@@ -594,7 +595,7 @@ class Nuscenes2Occ3D:
                 # with_car_voxel,
                 # with_car_sem,
                 coords[mask_pred],
-                voxel_state.reshape(-1)[mask_pred],
+                camera_voxel_state.reshape(-1)[mask_pred],
                 name=f"{timestamp}-free-gen",
                 viz=False,
                 voxel_size=self.voxel_size,
@@ -954,27 +955,12 @@ def calculate_camera_visibility(cam_infos, lidar_voxel_state, pc_range_min, voxe
     ray_start = origins[:, :3]
     ray_end = uv2points[:, :3]
     free_voxels = ray_casting(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape)
-    # free_voxels = np.concatenate(free_voxels)
-    # free_voxels = torch.from_numpy(free_voxels).to("cuda")
-    # free_voxels = torch.unique(free_voxels, dim=0)
-    # free_voxels = free_voxels.cpu().numpy()
-    # pcd = o3d.geometry.PointCloud()
-    # pcd.points = o3d.utility.Vector3dVector(free_voxels)
-    # o3d.io.write_point_cloud("viz/free_voxels.pcd", pcd)
-    #todo: 相机伪点云传播机制已验证，需要按照顺序计算遮挡与不可见
-    for free_voxel in free_voxels:
-        for voxel in free_voxel:
-            if lidar_voxel_state[voxel[0], voxel[1], voxel[2]] == 1:
-                update_voxel_state[voxel[0], voxel[1], voxel[2]] = 1
-                break
-            else:
-                update_voxel_state[voxel[0], voxel[1], voxel[2]] = lidar_voxel_state[voxel[0], voxel[1], voxel[2]] 
+
+    #!: 相机伪点云传播机制已验证，需要按照顺序计算遮挡与不可见
+    update_voxel_state = camera_ray_occ(free_voxels, lidar_voxel_state, update_voxel_state)
+
     return update_voxel_state
 
-
-# a = np.concatenate(free_voxels)
-# a = torch.from_numpy(a).to("cuda")
-# b = torch.unique(a, dim=0)
 
 
 if __name__ == "__main__":

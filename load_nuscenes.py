@@ -488,9 +488,12 @@ class Nuscenes2Occ3D:
             obj_id = obj_info["obj_id"]
             box = obj_info["box"]
 
-            raw_points = self.obj_points_bank[obj_id]["points"][:, :3]
-            mesh_points = self.obj_points_bank[obj_id]["sampled_points"]
-            points = np.vstack([raw_points, mesh_points])
+            raw_points = np.concatenate(self.obj_points_bank[obj_id]["points"])[:, :3]
+            if len(raw_points) < 0:
+                mesh_points = self.obj_points_bank[obj_id]["sampled_points"]
+                points = np.vstack([raw_points, mesh_points])
+            else:
+                points = raw_points
             points_ego = points @ rotate_yaw(box[6]) + box[:3]
             label = self.obj_points_bank[obj_id]["label"]
             points = np.concatenate(
@@ -536,7 +539,6 @@ class Nuscenes2Occ3D:
             trajectory_voxel = (trajectory_voxel + car_gemotry).reshape(-1,3)
             ego_sem = np.full(len(trajectory_voxel), 31, dtype=np.int32)
 
-            points_origin = trajectory_pose[batch_id]  #! broadcast yyds
 
             local_points = all_points_arr[:, [0, 1, 2, -1]].copy()
             local_points[:, :3] = (
@@ -547,8 +549,11 @@ class Nuscenes2Occ3D:
             local_points[:, :3] = (
                 local_points[:, :3] @ lidar2ego[:3, :3].T + lidar2ego[:3, 3]
             )
-            # dynamic_points = self.put_dynamic_objects(timestamp)
-            # local_points = np.concatenate([local_points, dynamic_points], axis=0)
+            dynamic_points = self.put_dynamic_objects(timestamp)
+            local_points = np.concatenate([local_points, dynamic_points], axis=0)
+            local_batch_id = np.concatenate([batch_id, np.full(len(dynamic_points), list(self.background_points_bank.keys()).index(timestamp))], axis=0)
+            points_origin = trajectory_pose[local_batch_id]  #! broadcast yyds
+
             #! 范围需要二次确认后统一： 范围确认无误，但在体素化时，需要转到第一象限进行操作以确保【取整】的一致性
             # range_mask = np.logical_and.reduce([np.abs(local_points[:, 0]) < 40, np.abs(local_points[:, 1]) < 40, local_points[:, 2] > -1, local_points[:, 2] < 5.4])
             range_mask = np.logical_and.reduce(
@@ -737,7 +742,7 @@ class Nuscenes2Occ3D:
             all_points_arr[comfirm_points_index, :3],
             all_points_arr[comfirm_points_index, -1],
             all_points_arr[noise_points_index, :3],
-            distance_threshold=1.5,
+            distance_threshold=0.5,
         )
         all_points_arr[noise_points_index, -1] = noise_points_labels
 

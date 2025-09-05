@@ -34,7 +34,7 @@ from ops.mmdetection3d.tools.misc.browse_dataset import show_det_data, show_resu
 from utils.ops import generate_35_category_colors, rotate_yaw, viz_mesh, viz_occ
 from utils.ray_operation import ray_casting, camera_ray_occ
 from utils.nuScenes_infos import *
-
+from utils import data_pipeline
 # import ray_casting_cuda
 
 
@@ -239,13 +239,11 @@ def init_dataset(data, token):
         pipeline=[
             dict(type="LoadPointsFromFile", coord_type="LIDAR", load_dim=5, use_dim=5),
             dict(type="RemoveSelfCenter", radius=2.5),
-            dict(
-                type="GetGround",
-            ),
+            dict(type="GetGround"),
             dict(type="LoadAnnotations3D", with_bbox_3d=True, with_label_3d=True),
-            dict(
-                type="GlobalAlignmentwithGT",
-            ),
+            dict(type="GetBoxPointIndices"),            
+            dict(type="GlobalAlignmentwithGT"), #! 自由度太少，框有误差，先单帧取点云再拼接
+        
         ]
     )
 
@@ -758,7 +756,8 @@ class Nuscenes2Occ3D:
         gt_boxes_3d = annos["gt_bboxes_3d"].tensor
         names = annos["gt_names"]
         gt_boxes_id = annos["gt_bboxes_id"]
-        obj_point_indices = box_np_ops.points_in_rbbox(points, gt_boxes_3d.numpy())
+        obj_point_indices = example['obj_point_indices']
+        # obj_point_indices = box_np_ops.points_in_rbbox(points, gt_boxes_3d.numpy())
 
         #! 区分地面/非地面, 前景(标注目标)/背景点云
         background_points_indices = np.where(~obj_point_indices.any(axis=1))[0]

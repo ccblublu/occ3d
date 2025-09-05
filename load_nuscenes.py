@@ -436,15 +436,18 @@ class Nuscenes2Occ3D:
         self.waiting_for_key_frame = defaultdict(list)
         if self.load_offline:
             self.save_and_load_offline()
+            all_points = list(self.background_points_bank.values())
+            all_points_arr = np.load("viz/all_points_arr.npy")
         else:
             for j in track_iter_progress(list(range(len(self.seq_dataset)))):
                 self.get_frame_data(j)
-
+            all_points = list(self.background_points_bank.values())
+            all_points_arr = np.vstack(all_points).astype(np.float32)
+            all_points_arr = self.filter_noise(all_points_arr)
         # self.sample_dynamic_objects()
+        # self.get_seq_image_segmentation()
+        # exit()
 
-        all_points = list(self.background_points_bank.values())
-        all_points_arr = np.vstack(all_points).astype(np.float32)
-        all_points_arr = self.filter_noise(all_points_arr)
         batch_id = np.concatenate(
             [
                 np.full(len(points), i)
@@ -899,22 +902,24 @@ def assign_voxel_labels_vectorized(
         voxel_dict[voxel_key].append(i)
         # voxel_dict[voxel_key].append(labels[i])
     # 提取体素坐标和标签
-    voxel_coords = []
+    occ_coords = []
     voxel_labels = []
     # voxel_counts = []
     for voxel_key, idx_list in voxel_dict.items():
         # 计算体素中心坐标
-        center = (np.array(voxel_key) + 0.5) * voxel_size
-        voxel_coords.append(center)
+        # center = (np.array(voxel_key) + 0.5) * voxel_size
+        center = np.array(voxel_key)
+        occ_coords.append(center)
         # 使用多数投票确定体素标签
         label_list = labels[idx_list]
         unique, counts = np.unique(label_list, return_counts=True)
-        counts[unique == 0] = -1  # 将背景标签的计数设为-1，使其不会影响多数投票
+        counts[unique == 0] = 0  # 将背景标签的计数设为-1，使其不会影响多数投票
+        counts[unique == 11] = min((unique == 11).sum(), 10)
         voxel_labels.append(unique[np.argmax(counts)])
         # voxel_counts.append(len(label_list))
 
     return (
-        np.array(voxel_coords) + np.array(pc_range[3:]),
+        np.array(occ_coords),
         np.array(voxel_labels),
         # dict(voxel_dict),
     )

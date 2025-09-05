@@ -32,7 +32,7 @@ import pypatchworkpp
 
 from ops.mmdetection3d.tools.misc.browse_dataset import show_det_data, show_result
 from utils.ops import generate_35_category_colors, rotate_yaw, viz_mesh, viz_occ
-from utils.ray_operation import ray_casting, camera_ray_occ
+from utils.ray_operation import ray_casting, camera_ray_occ, image_guided_voxel_refinement, project_voxel2pixel
 from utils.nuScenes_infos import *
 from ops.segmentation.image_segmentaiton import init_model
 from utils import data_pipeline
@@ -398,9 +398,14 @@ class Nuscenes2Occ3D:
         self.pc_range = np.array([40, 40, 5.4, -40, -40, -1])
         self.voxel_size = 0.4
         self.load_offline = True
+        # self.load_offline = False
         self.eps = 1e-5
         self.camera_list = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
+        # self.cv_seg_model = init_model()
         self.cv_seg_model = init_model() if not self.load_offline else None
+        # self.clasees_map = {v: k for k, v in enumerate(self.cv_seg_model.CLASSES)}
+        self.ade20k2nuscidx = np.vectorize(ADE20K2NUSC.get)
+
     def get_semantic(self, image_path):
         if self.load_offline:    
             result = np.load(osp.join("viz", osp.basename(image_path) + ".npy"))
@@ -561,12 +566,21 @@ class Nuscenes2Occ3D:
             # points_origin = points_origin[frame_mask]
             # viz_occ(local_points[:, :3], local_points[:, -1], name=str(timestamp))
             print(f"get points voxelization: {timestamp}")
-            voxel_coords_, voxel_labels_ = assign_voxel_labels_vectorized(
+            occ_coords, voxel_labels_ = assign_voxel_labels_vectorized(
                 local_points[:, :3],
                 local_points[:, -1],
                 voxel_size=self.voxel_size,
                 pc_range=self.pc_range,
             )
+            # relative_voxel_coords_ = ((voxel_coords_ - self.pc_range[3:]) / self.voxel_size - 0.5).astype(int)
+
+            occ_dense_label = np.full((spatial_shape), 17, dtype=np.int32) #! 17 free
+            occ_dense_label[occ_coords[:, 0], occ_coords[:, 1], occ_coords[:, 2]] = voxel_labels_
+
+            # print(f"calculate lidar visibility: {timestamp}")
+            lidar_voxel_state = calculate_lidar_visibility(local_points, points_origin, occ_coords, np.array(self.pc_range)[3:], np.array([self.voxel_size, self.voxel_size, self.voxel_size]), spatial_shape)
+            camera_voxel_state, free_voxels, cam_id_count = calculate_camera_visibility(cameras, lidar_voxel_state, np.array(self.pc_range)[3:], np.array([self.voxel_size, self.voxel_size, self.voxel_size]), spatial_shape)
+            semantics_adjust = self.segmentation_refine(cameras, free_voxels, cam_id_count, occ_dense_label, camera_voxel_state)
             
             # occ_gt_path = f"{root}/{self.timestamp2token[timestamp]}/labels.npz"
             # occ_gt_info = np.load(occ_gt_path)
@@ -906,7 +920,7 @@ def assign_voxel_labels_vectorized(
     )
 
 
-def calculate_lidar_visibility(ray_start, ray_end, voxel_coords, pc_range_min, voxel_size, spatial_shape):
+def calculate_lidar_visibility(ray_start, ray_end, occ_coords, pc_range_min, voxel_size, spatial_shape):
     """
     计算单帧下的点云可见性(全序列计算)
 
@@ -926,12 +940,12 @@ def calculate_lidar_visibility(ray_start, ray_end, voxel_coords, pc_range_min, v
             voxel_size,
             spatial_shape
         )
-    voxel_points = ((voxel_coords - pc_range_min) / voxel_size - 0.5).astype(int)
+    # voxel_points = ((voxel_coords - pc_range_min) / voxel_size - 0.5).astype(int)
     
     free_voxel = np.concatenate(free_voxels) 
     voxel_state =  np.full((spatial_shape), -1, dtype=np.int32)
     voxel_state[free_voxel[:,0], free_voxel[:,1], free_voxel[:,2]] = 0
-    voxel_state[voxel_points[:,0], voxel_points[:,1], voxel_points[:,2]] = 1
+    voxel_state[occ_coords[:,0], occ_coords[:,1], occ_coords[:,2]] = 1
     return voxel_state
 
 
@@ -970,13 +984,13 @@ def calculate_camera_visibility(cam_infos, lidar_voxel_state, pc_range_min, voxe
         depth = np.full(u * v, DEPTH_MAX, dtype=np.float32)
         uvs = image_coords * depth[:, None]
         cam_coords = uvs @ np.linalg.inv(intrinsic.T)
-        ego_coords = cam_coords @ cam2ego[:3, :3].T + cam2ego[:3, 3] 
+        ego_coords = cam_coords @ cam2ego[:3, :3].T + cam2ego[:3, 3]
         # origin = np.zeros((4, 4), dtype=np.float32)
         # origin[3, 3] = 1
         ego_origin = cam2ego[None, :3, 3]
         uv2points.append(ego_coords)
         origins.append(ego_origin.repeat(ego_coords.shape[0], 0))
-        cam_id_count[cam_type] = u * v
+        cam_id_count[cam_type] = (u, v)
 
     uv2points = np.concatenate(uv2points, axis=0)
     origins = np.concatenate(origins, axis=0)
@@ -987,9 +1001,7 @@ def calculate_camera_visibility(cam_infos, lidar_voxel_state, pc_range_min, voxe
     #!: 相机伪点云传播机制已验证，需要按照顺序计算遮挡与不可见
     update_voxel_state = camera_ray_occ(free_voxels, lidar_voxel_state, update_voxel_state)
 
-    return update_voxel_state
-
-
+    return update_voxel_state, free_voxels, cam_id_count
 
 if __name__ == "__main__":
     from ops.mmdetection3d.tools.data_converter.nuscenes_converter import (

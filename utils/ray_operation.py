@@ -114,7 +114,7 @@ def ray_casting_(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
     return free_voxel
 
 
-@njit(cache=True)
+@njit()
 def camera_ray_occ(free_voxels:List[np.ndarray], lidar_voxel_state:np.ndarray, camera_voxel_state:np.ndarray):
     for free_voxel in free_voxels:
         for voxel in free_voxel:
@@ -124,3 +124,73 @@ def camera_ray_occ(free_voxels:List[np.ndarray], lidar_voxel_state:np.ndarray, c
             else:
                 camera_voxel_state[voxel[0], voxel[1], voxel[2]] = lidar_voxel_state[voxel[0], voxel[1], voxel[2]]
     return camera_voxel_state
+
+
+@njit()
+def image_guided_voxel_refinement(semantics_adjust, image_semantics, free_voxels, voxel_semantics, max_v):
+    count = 0
+    for free_voxel in free_voxels:
+        x = count // max_v
+        y = count % max_v
+        voxel_label = image_semantics[y, x]
+        if voxel_label == 0:
+            count += 1
+            continue
+        free_count = 0
+        vaild_flag = False
+        for voxel in free_voxel:
+            if voxel_semantics[voxel[0], voxel[1], voxel[2]] == voxel_label:
+                semantics_adjust[voxel[0], voxel[1], voxel[2]] = voxel_label
+                vaild_flag = True
+                break
+            else:
+                free_count += 1
+        if vaild_flag:
+            for i in range(free_count):
+                voxel = free_voxel[i]
+                semantics_adjust[voxel[0], voxel[1], voxel[2]] = 0
+        count += 1
+    return semantics_adjust
+
+
+def project_points_to_image(points, camera_intrinsic, cam2ego, max_u, max_v):
+    blank = np.zeros((max_v, max_u), dtype=np.uint8)
+    index_order = np.argsort(np.linalg.norm(points[:, :3], axis=1))[::-1]
+    points = points[index_order]
+    cam_coords = (points[:,:3] - cam2ego[:3, 3]) @ cam2ego[:3, :3]
+    image_coords = cam_coords @ camera_intrinsic.T
+    uvs = image_coords[:, :2] / image_coords[:, 2:]
+    mask = np.logical_and.reduce([image_coords[:, -1] > 0, uvs[:, 0] >= 0, uvs[:, 0] < max_u, uvs[:, 1] >= 0, uvs[:, 1] < max_v])
+    uvs = uvs[mask].astype(np.int32)
+    label = points[mask, -1]
+    blank[uvs[:, 1], uvs[:, 0]] = label
+    return blank
+
+@njit()
+def project_voxel2pixel(blank_sem, free_voxels, voxel_labels_, camera_voxel_state, max_v):
+    """
+    索引数是对得上的，没必要在通过坐标回溯，直接index归位
+    """
+    count = 0
+    for free_voxel in free_voxels:
+        x = count // max_v
+        y = count % max_v
+        for voxel in free_voxel:
+            if camera_voxel_state[voxel[0], voxel[1], voxel[2]] == 1:
+                blank_sem[y, x] = voxel_labels_[voxel[0], voxel[1], voxel[2]]
+                break
+        count += 1
+    # todo :动态物体要先拿回来
+    return blank_sem
+# import cv2
+# blank = np.zeros((900,1600), dtype=np.int32)
+# part_free_voxels = free_voxels[:1440000]
+# max_v, max_u = blank.shape
+# for count, free_voxel in enumerate(part_free_voxels):
+#     x = count // max_v
+#     y = count % max_v
+#     for depth, voxel in enumerate(free_voxel):
+#         if camera_voxel_state[voxel[0], voxel[1], voxel[2]] == 1:
+#             blank[y,x] = depth
+#             break
+# cv2.imwrite('depth-04.png', blank)

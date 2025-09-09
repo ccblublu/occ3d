@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List
 
 import torch
+import cv2
 import imagesize
 import open3d as o3d
 import numpy as np
@@ -408,7 +409,7 @@ class Nuscenes2Occ3D:
 
     def get_semantic(self, image_path):
         if self.load_offline:    
-            result = np.load(osp.join("viz", osp.basename(image_path) + ".npy"))
+            result = np.load(osp.join("viz/seg_pred", osp.basename(image_path) + ".npy"))
         else:
             result = inference_segmentor(self.model, image_path)# 在线推理显存吃不消
         return result
@@ -454,6 +455,7 @@ class Nuscenes2Occ3D:
                 for i, points in enumerate(list(self.background_points_bank.values()))
             ]
         )
+        all_points_arr, batch_id = self.filter_dynamic_points(all_points_arr, batch_id)
 
         #! 先采样再重建
         if self.get_mesh_sample:
@@ -462,7 +464,7 @@ class Nuscenes2Occ3D:
         #! 还原至单帧自车坐标系
         self.get_key_frame_data(all_points_arr, batch_id)
 
-    def save_and_load_offline(self):
+    def save_and_load_offline(self, seq_id):
         print("\nloading offline data……")
         keys = [
             "obj_points_bank",
@@ -473,14 +475,18 @@ class Nuscenes2Occ3D:
             "cams_bank"
         ]
         # for key in keys:
-        #     with open(f"viz/{key}.pkl", "wb") as f:
-        #         pickle.dump(getattr(self, key), f)
+            # with open(f"viz/local_run_cache/{seq_id}_{key}.pkl", "wb") as f:
+                # pickle.dump(getattr(self, key), f)
         for k in keys:
-            with open(f"viz/{k}.pkl", "rb") as f:
+            with open(f"viz/local_run_cache/{seq_id}_{k}.pkl", "rb") as f:
                 info = pickle.load(f)
                 setattr(self, k, info)
         # self.obj_points_bank = self.obj_points_bank.astype(np.float32)
         # self.background_points_bank = self.background_points_bank.astype(np.float32)
+    def filter_dynamic_points(self, points, batch_id):
+        mask = np.logical_or(points[:,-1] >=1, points[:,-1] <=10)
+        return points[mask], batch_id[mask]
+
 
     def put_dynamic_objects(self, timestamp):
         frame_obj_points = []
@@ -569,6 +575,10 @@ class Nuscenes2Occ3D:
 
             local_points = local_points[range_mask]
             points_origin = points_origin[range_mask]
+            #! 噪音点过滤
+            noise_mask = local_points[:, -1] != 0
+            local_points = local_points[noise_mask]
+            points_origin = points_origin[noise_mask]
             # frame_mask = batch_id[range_mask] == 0
             # local_points = local_points[frame_mask]
             # points_origin = points_origin[frame_mask]
@@ -632,6 +642,7 @@ class Nuscenes2Occ3D:
     def segmentation_refine(self, cam_infos, free_voxels, cam_id_count, voxel_labels_, camera_voxel_state):
         start_pos = 0
         semantics_adjust = np.full_like(voxel_labels_, -1)
+        color = generate_35_category_colors(17)
         for cam_type, cam_info in cam_infos.items():
             max_u, max_v = cam_id_count[cam_type]
             point_count = max_u * max_v
@@ -643,7 +654,6 @@ class Nuscenes2Occ3D:
                 nusc_semantics,
                 free_voxel,
                 voxel_labels_,
-                # max_u,
                 max_v,
             )
             start_pos += point_count
@@ -655,6 +665,10 @@ class Nuscenes2Occ3D:
                 camera_voxel_state,
                 max_v
             )
+            ori_img = cv2.imread(cam_info["data_path"])
+            image_color = color[image.astype(int)] * 255
+            image_color[blank_sem==0] = 0
+            cv2.imwrite(f"viz/sence/{cam_info['data_path'].split('/')[-1]}", ori_img * 0.5 + image_color * 0.5)
         return semantics_adjust
 
 
@@ -876,13 +890,13 @@ class Nuscenes2Occ3D:
             cameras = self.cams_bank[timestamp]
             for camera_name, camera_data in cameras.items():
                 result = inference_segmentor(self.cv_seg_model, camera_data["data_path"])[0]
-                np.save(osp.join(f"./viz", osp.basename(camera_data["data_path"])),
+                np.save(osp.join(f"./viz/seg_pred", osp.basename(camera_data["data_path"])),
                     result,
                 )
                 # self.cv_seg_model.show_result(camera_data["data_path"], result, show=True)
 
 def assign_voxel_labels_vectorized(
-    points, labels, voxel_size=0.05, pc_range=[40, 40, 5.4, -40, -40, -1]
+    points, labels, voxel_size=0.05, pc_range=[40, 40, 5.4, -40, -40, -1], min_num=100
 ):
     """
     使用向量化操作高效地为体素分配标签
@@ -896,6 +910,10 @@ def assign_voxel_labels_vectorized(
     voxel_coords: 体素中心坐标 (M, 3)
     voxel_labels: 体素标签 (M,)
     """
+    # 噪声点过滤
+    # mask = labels != 0
+    # points = points[mask]
+    # labels = labels[mask]
     # 计算每个点所在的体素索引
     zero_point = points - np.array(pc_range[3:])
     voxel_indices = np.floor(zero_point / voxel_size).astype(int)
@@ -914,12 +932,17 @@ def assign_voxel_labels_vectorized(
         # 计算体素中心坐标
         # center = (np.array(voxel_key) + 0.5) * voxel_size
         center = np.array(voxel_key)
-        occ_coords.append(center)
         # 使用多数投票确定体素标签
         label_list = labels[idx_list]
         unique, counts = np.unique(label_list, return_counts=True)
         counts[unique == 0] = 0  # 将背景标签的计数设为-1，使其不会影响多数投票
-        counts[unique == 11] = min((unique == 11).sum(), 10)
+        voxel_label = unique[np.argmax(counts)]
+        if len(label_list) < min_num and voxel_label in [11,12,13]: #! 提高对于背景点的体素化点数条件
+            continue
+        # counts[unique == 11] = min((unique == 11).sum(), 10)
+        # if counts[unique == 11] < 200: #! 超强硬过噪处理
+            # counts[unique == 11] = 0
+        occ_coords.append(center)
         voxel_labels.append(unique[np.argmax(counts)])
         # voxel_counts.append(len(label_list))
 
@@ -1001,7 +1024,7 @@ def calculate_camera_visibility(cam_infos, lidar_voxel_state, pc_range_min, voxe
         uv2points.append(ego_coords)
         origins.append(ego_origin.repeat(ego_coords.shape[0], 0))
         cam_id_count[cam_type] = (u, v)
-
+        # break
     uv2points = np.concatenate(uv2points, axis=0)
     origins = np.concatenate(origins, axis=0)
     ray_start = origins[:, :3]

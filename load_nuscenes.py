@@ -9,11 +9,12 @@ from tqdm import tqdm
 from tqdm.contrib.concurrent import thread_map
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
-from typing import List
+
 
 import torch
 import cv2
 import imagesize
+from numba.typed import List
 import open3d as o3d
 import numpy as np
 from scipy import stats
@@ -648,7 +649,7 @@ class Nuscenes2Occ3D:
             point_count = max_u * max_v
             semantics = self.get_semantic(cam_info["data_path"]) #! h*w
             nusc_semantics = self.ade20k2nuscidx(semantics)
-            free_voxel = free_voxels[start_pos:start_pos + point_count]
+            free_voxel = List(free_voxels[start_pos:start_pos + point_count])
             semantics_adjust = image_guided_voxel_refinement(
                 semantics_adjust,
                 nusc_semantics,

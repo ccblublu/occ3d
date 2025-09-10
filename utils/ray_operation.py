@@ -1,4 +1,4 @@
-from typing import List 
+# from typing import List 
 import time
 
 import numpy as np
@@ -115,7 +115,7 @@ def ray_casting_(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
 
 
 @njit()
-def camera_ray_occ(free_voxels:List[np.ndarray], lidar_voxel_state:np.ndarray, camera_voxel_state:np.ndarray):
+def camera_ray_occ(free_voxels, lidar_voxel_state, camera_voxel_state):
     for free_voxel in free_voxels:
         for voxel in free_voxel:
             if lidar_voxel_state[voxel[0], voxel[1], voxel[2]] == 1:

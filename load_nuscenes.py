@@ -910,47 +910,56 @@ def assign_voxel_labels_vectorized(
     voxel_coords: 体素中心坐标 (M, 3)
     voxel_labels: 体素标签 (M,)
     """
-    # 噪声点过滤
-    # mask = labels != 0
-    # points = points[mask]
-    # labels = labels[mask]
     # 计算每个点所在的体素索引
     zero_point = points - np.array(pc_range[3:])
     voxel_indices = np.floor(zero_point / voxel_size).astype(int)
-    # 使用字典存储每个体素中的标签
-    voxel_dict = defaultdict(list)
-    # 将每个点的标签添加到对应体素的列表中
-    for i, idx in enumerate(voxel_indices):
-        voxel_key = tuple(idx)
-        voxel_dict[voxel_key].append(i)
-        # voxel_dict[voxel_key].append(labels[i])
-    # 提取体素坐标和标签
-    occ_coords = []
-    voxel_labels = []
-    # voxel_counts = []
-    for voxel_key, idx_list in voxel_dict.items():
-        # 计算体素中心坐标
-        # center = (np.array(voxel_key) + 0.5) * voxel_size
-        center = np.array(voxel_key)
-        # 使用多数投票确定体素标签
-        label_list = labels[idx_list]
-        unique, counts = np.unique(label_list, return_counts=True)
-        counts[unique == 0] = 0  # 将背景标签的计数设为-1，使其不会影响多数投票
-        voxel_label = unique[np.argmax(counts)]
-        if len(label_list) < min_num and voxel_label in [11,12,13]: #! 提高对于背景点的体素化点数条件
-            continue
-        # counts[unique == 11] = min((unique == 11).sum(), 10)
-        # if counts[unique == 11] < 200: #! 超强硬过噪处理
-            # counts[unique == 11] = 0
-        occ_coords.append(center)
-        voxel_labels.append(unique[np.argmax(counts)])
-        # voxel_counts.append(len(label_list))
 
-    return (
-        np.array(occ_coords),
-        np.array(voxel_labels),
-        # dict(voxel_dict),
-    )
+    # 动态计算每个维度的跨度
+    dims = np.ceil((np.array(pc_range[:3]) - np.array(pc_range[3:])) / voxel_size).astype(int)
+    # 将3D索引映射为1D唯一ID
+    voxel_1d = np.ravel_multi_index(
+        (voxel_indices).T, dims, mode='clip'
+    )  # shape (N,)
+    # Step 3: 对体素ID排序，分组统计
+    sort_idx = np.argsort(voxel_1d)
+    sorted_voxel = voxel_1d[sort_idx]
+    sorted_labels = labels[sort_idx]
+    sorted_labels = sorted_labels.astype(np.int32)
+    # 找到每个体素组的边界
+    unique_voxel, group_starts = np.unique(sorted_voxel, return_index=True)
+    idx_3d = np.unravel_index(unique_voxel, dims)
+    voxel_coords = np.stack(idx_3d, axis=1).astype(np.int32)
+    group_ends = np.append(group_starts[1:], len(sorted_voxel))
+    # Step 4: 对每个体素组进行多数投票（向量化）
+    voxel_labels_list = []
+    voxel_coords_list = []
+    max_label = int(np.max(labels) + 1)
+    for i in range(len(unique_voxel)):
+        start, end = group_starts[i], group_ends[i]
+        group_labels = sorted_labels[start:end]
+        n_points = len(group_labels)
+        cnt = np.bincount(group_labels, minlength=max_label)
+        # 多数投票，但忽略背景标签 0
+        cnt[0] = 0  # 忽略背景
+        if cnt.sum() == 0:
+            continue
+        majority_label = np.argmax(cnt)
+        # unique_lbl, counts = np.unique(group_labels, return_counts=True)
+        # 将背景标签计数设为0，不影响argmax
+        # counts[unique_lbl == 0] = 0
+        # if np.all(counts == 0):  # 全是背景点 → 跳过或设为0？
+            # continue
+        # majority_label = unique_lbl[np.argmax(counts)]
+        # 应用 min_num 过滤条件
+        if n_points < min_num and majority_label in [11, 12, 13]:
+            continue
+        voxel_labels_list.append(majority_label)
+        voxel_coords_list.append(voxel_coords[i])
+    if len(voxel_coords_list) == 0:
+        return np.empty((0, 3)), np.empty((0,), dtype=labels.dtype)
+
+    return np.stack(voxel_coords_list), np.array(voxel_labels_list)
+
 
 
 def calculate_lidar_visibility(ray_start, ray_end, occ_coords, pc_range_min, voxel_size, spatial_shape):

@@ -1017,7 +1017,6 @@ def calculate_camera_visibility(cam_infos, lidar_voxel_state, pc_range_min, voxe
     # uv2points = []
     # origins = []
     cam_id_count = {}
-    voxel_indices_output, voxel_nums_output = [], []
     free_voxels_output = []
     for cam_type, cam_info in cam_infos.items():        
         u, v = imagesize.get(cam_info['data_path'])
@@ -1031,23 +1030,26 @@ def calculate_camera_visibility(cam_infos, lidar_voxel_state, pc_range_min, voxe
         uvs = image_coords * depth[:, None]
         cam_coords = uvs @ np.linalg.inv(intrinsic.T)
         ego_coords = cam_coords @ cam2ego[:3, :3].T + cam2ego[:3, 3]
-        # origin = np.zeros((4, 4), dtype=np.float32)
-        # origin[3, 3] = 1
-        ego_origin = cam2ego[None, :3, 3]
-        uv2points.append(ego_coords)
-        origins.append(ego_origin.repeat(ego_coords.shape[0], 0))
+
+        ego_origin = cam2ego[None, :3, 3].repeat(ego_coords.shape[0], 0)
+        # uv2points.append(ego_coords)
+        # origins.append(ego_origin)
         cam_id_count[cam_type] = (u, v)
-        # break
-    uv2points = np.concatenate(uv2points, axis=0)
-    origins = np.concatenate(origins, axis=0)
-    ray_start = origins[:, :3]
-    ray_end = uv2points[:, :3]
-    free_voxels = ray_casting(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape)
+        voxel_indices, voxel_nums = ray_casting(ego_origin, ego_coords, pc_range_min, voxel_size, spatial_shape)
+        update_voxel_state, free_voxels = camera_ray_occ(voxel_indices, voxel_nums, lidar_voxel_state, update_voxel_state)
+        free_voxels = list(free_voxels)
+        assert len(free_voxels) == len(voxel_indices)
+        free_voxels_output.extend(free_voxels)
 
+    # uv2points = np.concatenate(uv2points, axis=0)
+    # origins = np.concatenate(origins, axis=0)
+    # ray_start = origins[:, :3]
+    # ray_end = uv2points[:, :3]
+    # free_voxels = ray_casting(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape)
     #!: 相机伪点云传播机制已验证，需要按照顺序计算遮挡与不可见
-    update_voxel_state = camera_ray_occ(free_voxels, lidar_voxel_state, update_voxel_state)
+    # update_voxel_state = camera_ray_occ(List(free_voxels), lidar_voxel_state, update_voxel_state)
 
-    return update_voxel_state, free_voxels, cam_id_count
+    return update_voxel_state, free_voxels_output, cam_id_count
 
 if __name__ == "__main__":
     from ops.mmdetection3d.tools.data_converter.nuscenes_converter import (

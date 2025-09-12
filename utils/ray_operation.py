@@ -2,13 +2,17 @@
 import time
 
 import numpy as np
-from numba import cuda, float32, int32, njit
+from numba import njit, typeof
+from numba.typed import List
+from numba.types import int64, int32
 import torch
 import ray_casting_cuda 
 # import gc
+_sample = np.empty((0, 3), dtype=np.int32)  # 根据你的数据调整 dtype 和 shape
+_array_type = typeof(_sample)  # 得到 numba.types.Array(...)
 
 def ray_casting(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
-    start = time.time()
+    # start = time.time()
 
     ray_starts = torch.from_numpy(np.array(ray_start[..., :3])).to(torch.float32)
     ray_ends = torch.from_numpy(np.array(ray_end[..., :3])).to(torch.float32)
@@ -16,31 +20,41 @@ def ray_casting(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
     voxel_size = torch.from_numpy(np.array(voxel_size)).to(torch.float32).to('cuda')
     spatial_shape = torch.from_numpy(np.array(spatial_shape)).to(torch.int32).to('cuda')
     max_voxels_per_ray = (spatial_shape).sum().to(torch.int32).to('cuda')
-    max_length = 1000000
-    output = []
+    max_length = 1440000
+    voxel_indices_output, voxel_nums_output = [], []
     for i in range(int(np.ceil(ray_starts.shape[0]/max_length))):
         voxel_indices, voxel_nums = ray_casting_cuda.ray_casting_cuda(ray_starts[i*max_length:(i+1)*max_length].to('cuda'), ray_ends[i*max_length:(i+1)*max_length].to('cuda'), pc_range_min, voxel_size, spatial_shape.to(torch.int32), max_voxels_per_ray)
-        result = [voxel_index[:voxel_num].cpu().numpy() for voxel_index, voxel_num in zip(voxel_indices, voxel_nums)]
+        voxel_indices = voxel_indices.cpu().numpy()
+        voxel_nums = voxel_nums.cpu().numpy()
+        voxel_indices_output.append(voxel_indices)
+        voxel_nums_output.append(voxel_nums)
+
+        # mask = torch.arange(max_voxels_per_ray, device=voxel_indices.device).unsqueeze(0) < voxel_nums.unsqueeze(1)
+        # flat_indices = voxel_indices[mask]
+        # combined_np = flat_indices.cpu().numpy()
+        # split_points = torch.cumsum(voxel_nums, dim=0)[:-1].cpu().numpy()
+        # result = np.split(combined_np, split_points)
+        # result = [voxel_index[:voxel_num].cpu().numpy() for voxel_index, voxel_num in zip(voxel_indices, voxel_nums)]
         # torch.cuda.empty_cache()
-        output.extend(result)
-    print('ray_casting time cost:', time.time()-start)
+        # output.extend(result)
+    # print('ray_casting time cost:', time.time()-start)
     # voxel_indices, voxel_nums = ray_casting_cuda.ray_casting_cuda(ray_starts, ray_ends, pc_range_min, voxel_size, spatial_shape, max_voxels_per_ray)
     # start = time.time()
     # pc_range_min_ = np.array([-40.,-40.,-1.], dtype=np.float32)
     # voxel_size_ = np.array([0.4,0.4,0.4], dtype=np.float32)
     # spatial_shape_ = np.array([200,200,16], dtype=np.int32)
     # # for index in range(10000):
-    # while True:
-    #     index = 0
-    #     ray_start_ = ray_start[index, :3].astype(np.float32)
-    #     ray_end_ = ray_end[index, :3].astype(np.float32)
-    #     ray_casting_(ray_start_, ray_end_, pc_range_min_, voxel_size_, spatial_shape_)
+    # # while True:
+    # index = 0
+    # ray_start_ = ray_start[index, :3].astype(np.float32)
+    # ray_end_ = ray_end[index, :3].astype(np.float32)
+    # ray_casting_(ray_start_, ray_end_, pc_range_min_, voxel_size_, spatial_shape_)
     # # # 返回单个射线的结果
     # # print('time1:', time.time()-start)
     # # output = [voxel_index[:voxel_num] for voxel_index, voxel_num in zip(voxel_indices, voxel_nums)]
     # torch.cuda.empty_cache()
     # gc.collect()
-    return output
+    return np.concatenate(voxel_indices_output), np.concatenate(voxel_nums_output)
 
 # @njit
 def ray_casting_(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):

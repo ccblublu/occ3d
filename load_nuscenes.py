@@ -34,7 +34,7 @@ import pypatchworkpp
 
 from ops.mmdetection3d.tools.misc.browse_dataset import show_det_data, show_result
 from utils.ops import generate_35_category_colors, rotate_yaw, viz_mesh, viz_occ
-from utils.ray_operation import ray_casting, camera_ray_occ, image_guided_voxel_refinement, project_voxel2pixel
+from utils.ray_operation import * 
 from utils.nuScenes_infos import *
 from ops.segmentation.image_segmentaiton import init_model
 from utils import data_pipeline
@@ -976,7 +976,7 @@ def calculate_lidar_visibility(ray_start, ray_end, occ_coords, pc_range_min, vox
     output:
         voxel_state
     """
-    free_voxels = ray_casting(
+    voxel_indices, voxel_nums = ray_casting(
             ray_start,
             ray_end,
             pc_range_min,
@@ -985,9 +985,10 @@ def calculate_lidar_visibility(ray_start, ray_end, occ_coords, pc_range_min, vox
         )
     # voxel_points = ((voxel_coords - pc_range_min) / voxel_size - 0.5).astype(int)
     
-    free_voxel = np.concatenate(free_voxels) 
+    # free_voxel = np.concatenate(free_voxels) 
     voxel_state =  np.full((spatial_shape), -1, dtype=np.int32)
-    voxel_state[free_voxel[:,0], free_voxel[:,1], free_voxel[:,2]] = 0
+    voxel_state = put_voxel_state(voxel_state, voxel_indices, voxel_nums)
+    # voxel_state[free_voxel[:,0], free_voxel[:,1], free_voxel[:,2]] = 0
     voxel_state[occ_coords[:,0], occ_coords[:,1], occ_coords[:,2]] = 1
     return voxel_state
 
@@ -1013,9 +1014,11 @@ def calculate_camera_visibility(cam_infos, lidar_voxel_state, pc_range_min, voxe
     update_voxel_state =  np.full((spatial_shape), -1, dtype=np.int32)
 
 
-    uv2points = []
-    origins = []
+    # uv2points = []
+    # origins = []
     cam_id_count = {}
+    voxel_indices_output, voxel_nums_output = [], []
+    free_voxels_output = []
     for cam_type, cam_info in cam_infos.items():        
         u, v = imagesize.get(cam_info['data_path'])
         intrinsic = cam_info['cam_intrinsic']

@@ -129,15 +129,23 @@ def ray_casting_(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
 
 
 @njit()
-def camera_ray_occ(free_voxels, lidar_voxel_state, camera_voxel_state):
-    for free_voxel in free_voxels:
-        for voxel in free_voxel:
-            if lidar_voxel_state[voxel[0], voxel[1], voxel[2]] == 1:
-                camera_voxel_state[voxel[0], voxel[1], voxel[2]] = 1
+def camera_ray_occ(voxel_indices, voxel_nums, lidar_voxel_state, camera_voxel_state):
+    max_len = voxel_indices.shape[1] 
+    out_free_voxels = List.empty_list(_array_type)
+    for i in range(len(voxel_nums)):
+        for j in range(max_len):
+            if j == voxel_nums[i]:
+                segment = voxel_indices[i, :j].copy()  
+                out_free_voxels.append(segment)
+                break
+            if lidar_voxel_state[voxel_indices[i,j,0], voxel_indices[i,j,1], voxel_indices[i,j,2]] == 1:
+                camera_voxel_state[voxel_indices[i,j,0], voxel_indices[i,j,1], voxel_indices[i,j,2]] = 1
+                segment = voxel_indices[i, :voxel_nums[i]].copy()  
+                out_free_voxels.append(segment)    
                 break
             else:
-                camera_voxel_state[voxel[0], voxel[1], voxel[2]] = lidar_voxel_state[voxel[0], voxel[1], voxel[2]]
-    return camera_voxel_state
+                camera_voxel_state[voxel_indices[i,j,0], voxel_indices[i,j,1], voxel_indices[i,j,2]] = lidar_voxel_state[voxel_indices[i,j,0], voxel_indices[i,j,1], voxel_indices[i,j,2]]
+    return camera_voxel_state, out_free_voxels
 
 
 @njit()
@@ -194,8 +202,19 @@ def project_voxel2pixel(blank_sem, free_voxels, voxel_labels_, camera_voxel_stat
                 blank_sem[y, x] = voxel_labels_[voxel[0], voxel[1], voxel[2]]
                 break
         count += 1
-    # todo :动态物体要先拿回来
+    #// todo :动态物体要先拿回来
     return blank_sem
+
+@njit()
+def put_voxel_state(voxel_state, voxel_indices, voxel_nums):
+    max_len = voxel_indices.shape[1] 
+    for i in range(len(voxel_nums)):
+        for j in range(max_len):
+            if j == voxel_nums[i]:
+                break
+            voxel_state[voxel_indices[i, j, 0] , voxel_indices[i, j, 1], voxel_indices[i, j, 2]] = 0
+    return voxel_state
+
 # import cv2
 # blank = np.zeros((900,1600), dtype=np.int32)
 # part_free_voxels = free_voxels[:1440000]

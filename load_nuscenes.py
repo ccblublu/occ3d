@@ -437,9 +437,9 @@ class Nuscenes2Occ3D:
         self.key_frame_timestamps = self.timestamps[self.key_frame_indices]
         self.waiting_for_key_frame = defaultdict(list)
         if self.load_offline:
-            self.save_and_load_offline()
+            self.save_and_load_offline(seq_id)
             all_points = list(self.background_points_bank.values())
-            all_points_arr = np.load("viz/all_points_arr.npy")
+            all_points_arr = np.load(f"viz/local_run_cache/{seq_id}_all_points_arr.npy")
         else:
             for j in track_iter_progress(list(range(len(self.seq_dataset)))):
                 self.get_frame_data(j)
@@ -637,7 +637,7 @@ class Nuscenes2Occ3D:
             # coords = (coords - lidar2ego[:3, 3]) @ lidar2ego[:3, :3] @ lidar2start[
             #     :3, :3
             # ].T + lidar2start[:3, 3]
-            print(f"get image segmentation: {timestamp}")
+            # print(f"get image segmentation: {timestamp}")
 
     
     def segmentation_refine(self, cam_infos, free_voxels, cam_id_count, voxel_labels_, camera_voxel_state):
@@ -963,7 +963,7 @@ def assign_voxel_labels_vectorized(
 
 
 
-def calculate_lidar_visibility(ray_start, ray_end, occ_coords, pc_range_min, voxel_size, spatial_shape):
+def calculate_lidar_visibility(ray_start, ray_end, occ_coords, pc_range_min, voxel_size, spatial_shape, max_length = 1440000):
     """
     计算单帧下的点云可见性(全序列计算)
 
@@ -976,18 +976,19 @@ def calculate_lidar_visibility(ray_start, ray_end, occ_coords, pc_range_min, vox
     output:
         voxel_state
     """
-    voxel_indices, voxel_nums = ray_casting(
-            ray_start,
-            ray_end,
-            pc_range_min,
-            voxel_size,
-            spatial_shape
-        )
-    # voxel_points = ((voxel_coords - pc_range_min) / voxel_size - 0.5).astype(int)
-    
-    # free_voxel = np.concatenate(free_voxels) 
     voxel_state =  np.full((spatial_shape), -1, dtype=np.int32)
-    voxel_state = put_voxel_state(voxel_state, voxel_indices, voxel_nums)
+    for i in range(int(np.ceil(ray_start.shape[0]/max_length))):
+        voxel_indices, voxel_nums = ray_casting(
+                ray_start[i*max_length:(i+1)*max_length],
+                ray_end[i*max_length:(i+1)*max_length],
+                pc_range_min,
+                voxel_size,
+                spatial_shape
+            )
+        voxel_state = put_voxel_state(voxel_state, voxel_indices, voxel_nums)
+    # voxel_points = ((voxel_coords - pc_range_min) / voxel_size - 0.5).astype(int)
+    # free_voxel = np.concatenate(free_voxels) 
+    # voxel_state = put_voxel_state(voxel_state, voxel_indices, voxel_nums)
     # voxel_state[free_voxel[:,0], free_voxel[:,1], free_voxel[:,2]] = 0
     voxel_state[occ_coords[:,0], occ_coords[:,1], occ_coords[:,2]] = 1
     return voxel_state

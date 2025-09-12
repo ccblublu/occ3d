@@ -11,7 +11,7 @@ import ray_casting_cuda
 _sample = np.empty((0, 3), dtype=np.int32)  # 根据你的数据调整 dtype 和 shape
 _array_type = typeof(_sample)  # 得到 numba.types.Array(...)
 
-def ray_casting(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
+def ray_casting(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape, max_length = 1440000):
     # start = time.time()
 
     ray_starts = torch.from_numpy(np.array(ray_start[..., :3])).to(torch.float32)
@@ -20,7 +20,7 @@ def ray_casting(ray_start, ray_end, pc_range_min, voxel_size, spatial_shape):
     voxel_size = torch.from_numpy(np.array(voxel_size)).to(torch.float32).to('cuda')
     spatial_shape = torch.from_numpy(np.array(spatial_shape)).to(torch.int32).to('cuda')
     max_voxels_per_ray = (spatial_shape).sum().to(torch.int32).to('cuda')
-    max_length = 1440000
+    
     voxel_indices_output, voxel_nums_output = [], []
     for i in range(int(np.ceil(ray_starts.shape[0]/max_length))):
         voxel_indices, voxel_nums = ray_casting_cuda.ray_casting_cuda(ray_starts[i*max_length:(i+1)*max_length].to('cuda'), ray_ends[i*max_length:(i+1)*max_length].to('cuda'), pc_range_min, voxel_size, spatial_shape.to(torch.int32), max_voxels_per_ray)

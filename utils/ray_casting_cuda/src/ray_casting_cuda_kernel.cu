@@ -272,8 +272,8 @@ void ray_casting_cuda_launcher(
     int blocks = (batch_size + threads - 1) / threads;
     
     // 限制block数量避免过度创建
-    int max_blocks = prop.multiProcessorCount * 4;  // 每个SM 4个block
-    blocks = min(blocks, max_blocks);
+    // int max_blocks = prop.multiProcessorCount * 4;  // 每个SM 4个block
+    // blocks = min(blocks, max_blocks);
     
     // 启动kernel
     ray_casting_kernel_dynamic<<<blocks, threads, 0, stream>>>(

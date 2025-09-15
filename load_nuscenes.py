@@ -548,6 +548,8 @@ class Nuscenes2Occ3D:
 
 
             local_points = all_points_arr[:, [0, 1, 2, -1]].copy()
+            dynamic_points = self.put_dynamic_objects(timestamp)
+            local_points = np.concatenate([local_points, dynamic_points], axis=0)
             local_points[:, :3] = (
                 local_points[:, :3] - lidar2start[:3, 3]
             ) @ lidar2start[
@@ -556,8 +558,8 @@ class Nuscenes2Occ3D:
             local_points[:, :3] = (
                 local_points[:, :3] @ lidar2ego[:3, :3].T + lidar2ego[:3, 3]
             )
-            dynamic_points = self.put_dynamic_objects(timestamp)
-            local_points = np.concatenate([local_points, dynamic_points], axis=0)
+            # dynamic_points = self.put_dynamic_objects(timestamp)
+            # local_points = np.concatenate([local_points, dynamic_points], axis=0)
             local_batch_id = np.concatenate([batch_id, np.full(len(dynamic_points), list(self.background_points_bank.keys()).index(timestamp))], axis=0)
             points_origin = trajectory_pose[local_batch_id]  #! broadcast yyds
 

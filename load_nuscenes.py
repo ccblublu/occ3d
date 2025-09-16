@@ -1,7 +1,7 @@
 from collections import defaultdict
 from os import path as osp
 import pickle
-from tkinter import _flatten
+# from tkinter import _flatten
 import pyquaternion
 from scipy.spatial.transform import Rotation as R
 from sklearn.neighbors import NearestNeighbors
@@ -9,9 +9,9 @@ from tqdm import tqdm
 from tqdm.contrib.concurrent import thread_map
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-
-import torch
+import torch #! have to import
 import cv2
 import imagesize
 from numba.typed import List
@@ -23,21 +23,21 @@ from nuscenes import NuScenes
 from mmcv import load as mmcv_load
 from mmdet3d.datasets import build_dataset, DATASETS
 from mmcv import track_iter_progress
-from mmdet3d.datasets.custom_3d import Custom3DDataset
-from mmcv.utils import Registry, build_from_cfg
+# from mmdet3d.datasets.custom_3d import Custom3DDataset
+# from mmcv.utils import Registry, build_from_cfg
 from mmdet3d.core.bbox import LiDARInstance3DBoxes, get_box_type, box_np_ops
 from mmdet3d.datasets.pipelines import Compose
-from numba import njit, prange
-from mmseg.apis import inference_segmentor
+# from numba import njit, prange
+# from mmseg.apis import inference_segmentor
 import vdbfusion
 import pypatchworkpp
 
-from ops.mmdetection3d.tools.misc.browse_dataset import show_det_data, show_result
+# from ops.mmdetection3d.tools.misc.browse_dataset import show_det_data, show_result
 from utils.ops import generate_35_category_colors, rotate_yaw, viz_mesh, viz_occ
 from utils.ray_operation import *
 from utils.nuScenes_infos import *
-from ops.segmentation.image_segmentaiton import init_model
-from utils import data_pipeline
+# from ops.segmentation.image_segmentaiton import init_model
+from utils import data_pipeline #! have to import 
 
 # import ray_casting_cuda
 
@@ -70,8 +70,11 @@ class SeqNuscene(Dataset):
             seq_data[sample["scene_token"]].append(info)
         seq_data = dict(seq_data)
         out = []
+        self.seq_token = []
         for key, value in seq_data.items():
             out.append(init_dataset(value, key))
+            self.seq_token.append(key)
+
         return out
 
     def __len__(self):
@@ -79,6 +82,9 @@ class SeqNuscene(Dataset):
 
     def __getitem__(self, index):
         return self.seq_data[index]
+    
+    def get_token(self, index):
+        return self.seq_token[index]
 
 
 @DATASETS.register_module()
@@ -246,19 +252,19 @@ def init_dataset(data, token):
             dict(type="GetGround"),
             dict(type="LoadAnnotations3D", with_bbox_3d=True, with_label_3d=True),
             dict(type="GetBoxPointIndices"),
-            dict(
-                type="PtsSegment",
-                # checkpoint_path="/home/chen/workspace/points_segmentation/PointTransformerV3/Pointcept/runs/ontime_wo_ground/model/model_best.pth",
-                checkpoint_path="/media/chen/workspace/workspace/points_segmentation/PointTransformerV3/Pointcept/models/model_best.pth", # nuscenes
-                grid_size=0.05,
-                hash_type="fnv",
-                mode="train",
-                return_inverse=True,
-                return_grid_coord=True,
-                return_min_coord=False,
-                return_displacement=False,
-                project_displacement=False,
-            ),
+            # dict(
+            #     type="PtsSegment",
+            #     # checkpoint_path="/home/chen/workspace/points_segmentation/PointTransformerV3/Pointcept/runs/ontime_wo_ground/model/model_best.pth",
+            #     checkpoint_path="/media/chen/workspace/workspace/points_segmentation/PointTransformerV3/Pointcept/models/model_best.pth", # nuscenes
+            #     grid_size=0.05,
+            #     hash_type="fnv",
+            #     mode="train",
+            #     return_inverse=True,
+            #     return_grid_coord=True,
+            #     return_min_coord=False,
+            #     return_displacement=False,
+            #     project_displacement=False,
+            # ),
             dict(
                 type="GlobalAlignmentwithGT"
             ),  #! 自由度太少，框有误差，先单帧取点云再拼接
@@ -408,15 +414,17 @@ def fine2coarseidx(fine_name):
 
 
 class Nuscenes2Occ3D:
-    def __init__(self, nuscenes_version="v1.0-mini"):
+    def __init__(self, data_path, nuscenes_version="v1.0-mini"):
         pass
         self.get_mesh_sample = False
         self.colors = generate_35_category_colors(35)
         self.pc_range = np.array([40, 40, 5.4, -40, -40, -1])
         self.voxel_size = 0.4
-        self.load_offline = True
-        # self.load_offline = False
-        
+        # self.load_offline = True
+        self.load_offline = False
+        self.data_path = Path(data_path)
+        self.save_path = self.data_path / "occ3d_gen"
+        self.save_path.mkdir(exist_ok=True, parents=True)
         self.eps = 1e-5
         self.camera_list = [
             "CAM_FRONT",
@@ -432,22 +440,28 @@ class Nuscenes2Occ3D:
         self.ade20k2nuscidx = np.vectorize(ADE20K2NUSC.get)
 
     def get_semantic(self, image_path):
-        if self.load_offline:
-            result = np.load(
-                osp.join("viz/seg_pred", osp.basename(image_path) + ".npy")
-            )
-        else:
-            result = inference_segmentor(self.model, image_path)  # 在线推理显存吃不消
+        result = np.load(self.data_path / "seg_pred" / self.seq_token / f"{Path(image_path).name}.npy"        )
+        # if self.load_offline:
+        #     result = np.load(
+        #         osp.join("viz/seg_pred", osp.basename(image_path) + ".npy")
+        #     )
+        # else:
+        #     result = inference_segmentor(self.cv_seg_model, image_path)  # 在线推理显存吃不消
         return result
 
     def main(self, data_path, info_path):
-        self.dataset = SeqNuscene(data_path, info_path, nuscenes_version="v1.0-mini")
+        
+        self.dataset = SeqNuscene(self.data_path, info_path, nuscenes_version="v1.0-mini")
         for i in track_iter_progress(list(range(len(self.dataset)))):
+            self.seq_token = self.dataset.get_token(i)
+            self.sqe_save_path = self.save_path / self.seq_token
+            self.sqe_save_path.mkdir(exist_ok=True, parents=True)
             self.seq_run(i)
 
     def seq_run(self, seq_id):
         # self.dataset = SeqNuscene(data_path, info_path, nuscenes_version="v1.0-mini")
         # for i in track_iter_progress(list(range(len(self.dataset)))):
+        # self.seq_id = seq_id
         self.seq_dataset = self.dataset[seq_id]
         self.obj_points_bank = {}
         self.obj_info_bank = {}
@@ -481,7 +495,7 @@ class Nuscenes2Occ3D:
                 for i, points in enumerate(list(self.background_points_bank.values()))
             ]
         )
-        all_points_arr, batch_id = self.filter_dynamic_points(all_points_arr, batch_id, idx=4)
+        all_points_arr, batch_id = self.filter_dynamic_points(all_points_arr, batch_id, idx=-1)
 
         #! 先采样再重建
         if self.get_mesh_sample:
@@ -659,7 +673,10 @@ class Nuscenes2Occ3D:
             semantics_adjust = self.segmentation_refine(
                 cameras, free_voxels, cam_id_count, occ_dense_label, camera_voxel_state
             )
-
+            occ_dense_label = np.where(semantics_adjust != -1, semantics_adjust, occ_dense_label)
+            #! save labels
+            np.savez(self.sqe_save_path/ self.timestamp2token[timestamp] / "labels.npz", semantics=occ_dense_label, mask_lidar=lidar_voxel_state, mask_camera=camera_voxel_state)
+            
             # occ_gt_path = f"{root}/{self.timestamp2token[timestamp]}/labels.npz"
             # occ_gt_info = np.load(occ_gt_path)
             # occ_gt = occ_gt_info["semantics"].reshape(-1)
@@ -718,17 +735,18 @@ class Nuscenes2Occ3D:
                 max_v,
             )
             start_pos += point_count
-            blank_sem = np.zeros_like(nusc_semantics)
-            image = project_voxel2pixel(
-                blank_sem, free_voxel, voxel_labels_, camera_voxel_state, max_v
-            )
-            ori_img = cv2.imread(cam_info["data_path"])
-            image_color = color[image.astype(int)] * 255
-            image_color[blank_sem == 0] = 0
-            cv2.imwrite(
-                f"viz/sence/{cam_info['data_path'].split('/')[-1]}",
-                ori_img * 0.5 + image_color * 0.5,
-            )
+            #! OCC投影可视化
+            # blank_sem = np.zeros_like(nusc_semantics)
+            # image = project_voxel2pixel(
+                # blank_sem, free_voxel, voxel_labels_, camera_voxel_state, max_v
+            # )
+            # ori_img = cv2.imread(cam_info["data_path"])
+            # image_color = color[image.astype(int)] * 255
+            # image_color[blank_sem == 0] = 0
+            # cv2.imwrite(
+            #     f"viz/sence/{cam_info['data_path'].split('/')[-1]}",
+            #     ori_img * 0.5 + image_color * 0.5,
+            # )
         return semantics_adjust
 
     def sample_dynamic_objects(
@@ -944,17 +962,17 @@ class Nuscenes2Occ3D:
             )
         return
 
-    def get_seq_image_segmentation(self):
-        for i, timestamp in enumerate(tqdm(self.key_frame_timestamps)):
-            cameras = self.cams_bank[timestamp]
-            for camera_name, camera_data in cameras.items():
-                result = inference_segmentor(
-                    self.cv_seg_model, camera_data["data_path"]
-                )[0]
-                np.save(
-                    osp.join(f"./viz/seg_pred", osp.basename(camera_data["data_path"])),
-                    result,
-                )
+    # def get_seq_image_segmentation(self):
+    #     for i, timestamp in enumerate(tqdm(self.key_frame_timestamps)):
+    #         cameras = self.cams_bank[timestamp]
+    #         for camera_name, camera_data in cameras.items():
+    #             result = inference_segmentor(
+    #                 self.cv_seg_model, camera_data["data_path"]
+    #             )[0]
+    #             np.save(
+    #                 osp.join(f"./viz/seg_pred", osp.basename(camera_data["data_path"])),
+    #                 result,
+    #             )
                 # self.cv_seg_model.show_result(camera_data["data_path"], result, show=True)
 
 

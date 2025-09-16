@@ -34,10 +34,11 @@ import pypatchworkpp
 
 from ops.mmdetection3d.tools.misc.browse_dataset import show_det_data, show_result
 from utils.ops import generate_35_category_colors, rotate_yaw, viz_mesh, viz_occ
-from utils.ray_operation import * 
+from utils.ray_operation import *
 from utils.nuScenes_infos import *
 from ops.segmentation.image_segmentaiton import init_model
 from utils import data_pipeline
+
 # import ray_casting_cuda
 
 
@@ -244,9 +245,23 @@ def init_dataset(data, token):
             dict(type="RemoveSelfCenter", radius=2.5),
             dict(type="GetGround"),
             dict(type="LoadAnnotations3D", with_bbox_3d=True, with_label_3d=True),
-            dict(type="GetBoxPointIndices"),            
-            dict(type="GlobalAlignmentwithGT"), #! 自由度太少，框有误差，先单帧取点云再拼接
-        
+            dict(type="GetBoxPointIndices"),
+            dict(
+                type="PtsSegment",
+                # checkpoint_path="/home/chen/workspace/points_segmentation/PointTransformerV3/Pointcept/runs/ontime_wo_ground/model/model_best.pth",
+                checkpoint_path="/media/chen/workspace/workspace/points_segmentation/PointTransformerV3/Pointcept/models/model_best.pth", # nuscenes
+                grid_size=0.05,
+                hash_type="fnv",
+                mode="train",
+                return_inverse=True,
+                return_grid_coord=True,
+                return_min_coord=False,
+                return_displacement=False,
+                project_displacement=False,
+            ),
+            dict(
+                type="GlobalAlignmentwithGT"
+            ),  #! 自由度太少，框有误差，先单帧取点云再拼接
         ]
     )
 
@@ -401,18 +416,28 @@ class Nuscenes2Occ3D:
         self.voxel_size = 0.4
         self.load_offline = True
         # self.load_offline = False
+        
         self.eps = 1e-5
-        self.camera_list = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
+        self.camera_list = [
+            "CAM_FRONT",
+            "CAM_FRONT_RIGHT",
+            "CAM_FRONT_LEFT",
+            "CAM_BACK",
+            "CAM_BACK_LEFT",
+            "CAM_BACK_RIGHT",
+        ]
         # self.cv_seg_model = init_model()
-        self.cv_seg_model = init_model() if not self.load_offline else None
+        # self.cv_seg_model = init_model() if not self.load_offline else None
         # self.clasees_map = {v: k for k, v in enumerate(self.cv_seg_model.CLASSES)}
         self.ade20k2nuscidx = np.vectorize(ADE20K2NUSC.get)
 
     def get_semantic(self, image_path):
-        if self.load_offline:    
-            result = np.load(osp.join("viz/seg_pred", osp.basename(image_path) + ".npy"))
+        if self.load_offline:
+            result = np.load(
+                osp.join("viz/seg_pred", osp.basename(image_path) + ".npy")
+            )
         else:
-            result = inference_segmentor(self.model, image_path)# 在线推理显存吃不消
+            result = inference_segmentor(self.model, image_path)  # 在线推理显存吃不消
         return result
 
     def main(self, data_path, info_path):
@@ -456,7 +481,7 @@ class Nuscenes2Occ3D:
                 for i, points in enumerate(list(self.background_points_bank.values()))
             ]
         )
-        all_points_arr, batch_id = self.filter_dynamic_points(all_points_arr, batch_id)
+        all_points_arr, batch_id = self.filter_dynamic_points(all_points_arr, batch_id, idx=4)
 
         #! 先采样再重建
         if self.get_mesh_sample:
@@ -473,7 +498,7 @@ class Nuscenes2Occ3D:
             "timestamp2token",
             "background_points_bank",
             "frame_info_bank",
-            "cams_bank"
+            "cams_bank",
         ]
         # for key in keys:
             # with open(f"viz/local_run_cache/{seq_id}_{key}.pkl", "wb") as f:
@@ -484,10 +509,10 @@ class Nuscenes2Occ3D:
                 setattr(self, k, info)
         # self.obj_points_bank = self.obj_points_bank.astype(np.float32)
         # self.background_points_bank = self.background_points_bank.astype(np.float32)
-    def filter_dynamic_points(self, points, batch_id):
-        mask = np.logical_or(points[:,-1] >=1, points[:,-1] <=10)
-        return points[mask], batch_id[mask]
 
+    def filter_dynamic_points(self, points, batch_id, idx=-1):
+        mask = np.logical_or(points[:, idx] >= 1, points[:, idx] <= 10)
+        return points[mask], batch_id[mask]
 
     def put_dynamic_objects(self, timestamp):
         frame_obj_points = []
@@ -513,20 +538,22 @@ class Nuscenes2Occ3D:
     def get_key_frame_data(self, all_points_arr, batch_id):
         root = "/media/chen/data/OpenOcc/Occpancy3D/gts/scene-0061"
         all_coords = []
-        
+
         #! 获取序列下的自车坐标
         lidars2start = np.array(
             [i["lidar2start"] for i in self.frame_info_bank.values()]
         )
         lidars2egos = np.array([i["lidar2ego"] for i in self.frame_info_bank.values()])
-        spatial_shape = ((self.pc_range[:3] - self.pc_range[3:]) / self.voxel_size).astype(np.int32)
+        spatial_shape = (
+            (self.pc_range[:3] - self.pc_range[3:]) / self.voxel_size
+        ).astype(np.int32)
 
         for i, timestamp in enumerate(tqdm(self.key_frame_timestamps)):
 
             lidar2start = self.frame_info_bank[timestamp]["lidar2start"]
             lidar2ego = self.frame_info_bank[timestamp]["lidar2ego"]
             cameras = self.cams_bank[timestamp]
-            
+
             ego2cars = (
                 lidars2egos
                 @ np.linalg.inv(lidars2start)
@@ -541,11 +568,14 @@ class Nuscenes2Occ3D:
             # )
             #! 获取当前帧下的序列轨迹坐标点
             trajectory_pose = np.linalg.inv(ego2cars)[:, :3, -1]
-            trajectory_voxel = np.floor((trajectory_pose - np.array(self.pc_range[3:])) / self.voxel_size).astype(np.int32)
-            car_gemotry = np.stack(np.meshgrid([-1,0,1],[-1,0,1],[-1,0,1]), -1).reshape(-1,1,3)
-            trajectory_voxel = (trajectory_voxel + car_gemotry).reshape(-1,3)
+            trajectory_voxel = np.floor(
+                (trajectory_pose - np.array(self.pc_range[3:])) / self.voxel_size
+            ).astype(np.int32)
+            car_gemotry = np.stack(
+                np.meshgrid([-1, 0, 1], [-1, 0, 1], [-1, 0, 1]), -1
+            ).reshape(-1, 1, 3)
+            trajectory_voxel = (trajectory_voxel + car_gemotry).reshape(-1, 3)
             ego_sem = np.full(len(trajectory_voxel), 31, dtype=np.int32)
-
 
             local_points = all_points_arr[:, [0, 1, 2, -1]].copy()
             dynamic_points = self.put_dynamic_objects(timestamp)
@@ -560,7 +590,16 @@ class Nuscenes2Occ3D:
             )
             # dynamic_points = self.put_dynamic_objects(timestamp)
             # local_points = np.concatenate([local_points, dynamic_points], axis=0)
-            local_batch_id = np.concatenate([batch_id, np.full(len(dynamic_points), list(self.background_points_bank.keys()).index(timestamp))], axis=0)
+            local_batch_id = np.concatenate(
+                [
+                    batch_id,
+                    np.full(
+                        len(dynamic_points),
+                        list(self.background_points_bank.keys()).index(timestamp),
+                    ),
+                ],
+                axis=0,
+            )
             points_origin = trajectory_pose[local_batch_id]  #! broadcast yyds
 
             #! 范围需要二次确认后统一： 范围确认无误，但在体素化时，需要转到第一象限进行操作以确保【取整】的一致性
@@ -594,15 +633,33 @@ class Nuscenes2Occ3D:
                 pc_range=self.pc_range,
             )
             # relative_voxel_coords_ = ((voxel_coords_ - self.pc_range[3:]) / self.voxel_size - 0.5).astype(int)
+            occ_dense_label = np.full((spatial_shape), 17, dtype=np.int32)  #! 17 free
+            occ_dense_label[occ_coords[:, 0], occ_coords[:, 1], occ_coords[:, 2]] = (
+                voxel_labels_
+            )
 
-            occ_dense_label = np.full((spatial_shape), 17, dtype=np.int32) #! 17 free
-            occ_dense_label[occ_coords[:, 0], occ_coords[:, 1], occ_coords[:, 2]] = voxel_labels_
+            print(f"calculate lidar visibility of {len(local_points)}")
+            lidar_voxel_state = calculate_lidar_visibility(
+                local_points,
+                points_origin,
+                occ_coords,
+                np.array(self.pc_range)[3:],
+                np.array([self.voxel_size, self.voxel_size, self.voxel_size]),
+                spatial_shape,
+            )
+            print(f"calculate camera visibility")
+            camera_voxel_state, free_voxels, cam_id_count = calculate_camera_visibility(
+                cameras,
+                lidar_voxel_state,
+                np.array(self.pc_range)[3:],
+                np.array([self.voxel_size, self.voxel_size, self.voxel_size]),
+                spatial_shape,
+            )
+            print(f"calculate lidar-camrea refine")
+            semantics_adjust = self.segmentation_refine(
+                cameras, free_voxels, cam_id_count, occ_dense_label, camera_voxel_state
+            )
 
-            # print(f"calculate lidar visibility: {timestamp}")
-            lidar_voxel_state = calculate_lidar_visibility(local_points, points_origin, occ_coords, np.array(self.pc_range)[3:], np.array([self.voxel_size, self.voxel_size, self.voxel_size]), spatial_shape)
-            camera_voxel_state, free_voxels, cam_id_count = calculate_camera_visibility(cameras, lidar_voxel_state, np.array(self.pc_range)[3:], np.array([self.voxel_size, self.voxel_size, self.voxel_size]), spatial_shape)
-            semantics_adjust = self.segmentation_refine(cameras, free_voxels, cam_id_count, occ_dense_label, camera_voxel_state)
-            
             # occ_gt_path = f"{root}/{self.timestamp2token[timestamp]}/labels.npz"
             # occ_gt_info = np.load(occ_gt_path)
             # occ_gt = occ_gt_info["semantics"].reshape(-1)
@@ -614,7 +671,7 @@ class Nuscenes2Occ3D:
             # coords = np.stack([grid_x, grid_y, grid_z], axis=-1)
             # coords = coords.reshape(-1, 3)
             # mask_pred = (camera_voxel_state == 0).reshape(-1)
-            # trajectory_voxel = (trajectory_voxel + 0.5 ) * self.voxel_size + self.pc_range[3:] 
+            # trajectory_voxel = (trajectory_voxel + 0.5 ) * self.voxel_size + self.pc_range[3:]
             # # with_car_voxel = np.concatenate([coords[mask_pred], trajectory_voxel])
             # # with_car_sem = np.concatenate([voxel_state.reshape(-1)[mask_pred], ego_sem], dtype=np.int32)
             # viz_occ(
@@ -641,17 +698,18 @@ class Nuscenes2Occ3D:
             # ].T + lidar2start[:3, 3]
             # print(f"get image segmentation: {timestamp}")
 
-    
-    def segmentation_refine(self, cam_infos, free_voxels, cam_id_count, voxel_labels_, camera_voxel_state):
+    def segmentation_refine(
+        self, cam_infos, free_voxels, cam_id_count, voxel_labels_, camera_voxel_state
+    ):
         start_pos = 0
         semantics_adjust = np.full_like(voxel_labels_, -1)
         color = generate_35_category_colors(17)
         for cam_type, cam_info in cam_infos.items():
             max_u, max_v = cam_id_count[cam_type]
             point_count = max_u * max_v
-            semantics = self.get_semantic(cam_info["data_path"]) #! h*w
+            semantics = self.get_semantic(cam_info["data_path"])  #! h*w
             nusc_semantics = self.ade20k2nuscidx(semantics)
-            free_voxel = List(free_voxels[start_pos:start_pos + point_count])
+            free_voxel = List(free_voxels[start_pos : start_pos + point_count])
             semantics_adjust = image_guided_voxel_refinement(
                 semantics_adjust,
                 nusc_semantics,
@@ -662,19 +720,16 @@ class Nuscenes2Occ3D:
             start_pos += point_count
             blank_sem = np.zeros_like(nusc_semantics)
             image = project_voxel2pixel(
-                blank_sem,
-                free_voxel,
-                voxel_labels_,
-                camera_voxel_state,
-                max_v
+                blank_sem, free_voxel, voxel_labels_, camera_voxel_state, max_v
             )
             ori_img = cv2.imread(cam_info["data_path"])
             image_color = color[image.astype(int)] * 255
-            image_color[blank_sem==0] = 0
-            cv2.imwrite(f"viz/sence/{cam_info['data_path'].split('/')[-1]}", ori_img * 0.5 + image_color * 0.5)
+            image_color[blank_sem == 0] = 0
+            cv2.imwrite(
+                f"viz/sence/{cam_info['data_path'].split('/')[-1]}",
+                ori_img * 0.5 + image_color * 0.5,
+            )
         return semantics_adjust
-
-
 
     def sample_dynamic_objects(
         self,
@@ -751,17 +806,17 @@ class Nuscenes2Occ3D:
 
     def filter_noise(self, all_points_arr):
         """噪音点云二次赋值"""
-        noise_points_index = np.where(all_points_arr[:, -1] == 0)[0]
+        noise_points_index = np.where(all_points_arr[:, 3] == 0)[0]
         comfirm_points_index = np.setdiff1d(
             np.arange(len(all_points_arr)), noise_points_index
         )
         noise_points_labels = propagate_labels_with_knn(
             all_points_arr[comfirm_points_index, :3],
-            all_points_arr[comfirm_points_index, -1],
+            all_points_arr[comfirm_points_index, 3],
             all_points_arr[noise_points_index, :3],
             distance_threshold=0.5,
         )
-        all_points_arr[noise_points_index, -1] = noise_points_labels
+        all_points_arr[noise_points_index, 3] = noise_points_labels
 
         return all_points_arr
 
@@ -800,22 +855,16 @@ class Nuscenes2Occ3D:
         annos = example["ann_info"]
         timestamp = example["timestamp"]
         image_idx = example["sample_idx"]
-
         self.timestamp2token[timestamp] = image_idx
         self.frame_info_bank[timestamp] = {
             "lidar2start": annos["axis_align_matrix"],
             "lidar2ego": example["lidar2ego"],
         }
         points = example["points"].tensor.numpy()[:, :3].astype(np.float32)  #! (n, 3)
-        gt_pts_semantic_mask = annos["gt_pts_semantic_mask"]  #!(n, )
-
-        if gt_pts_semantic_mask is None:
-            gt_pts_semantic_mask = np.zeros(len(points), dtype=np.uint8)
-        points = np.concatenate((points, gt_pts_semantic_mask[:, None]), axis=1)
         gt_boxes_3d = annos["gt_bboxes_3d"].tensor
         names = annos["gt_names"]
         gt_boxes_id = annos["gt_bboxes_id"]
-        obj_point_indices = example['obj_point_indices']
+        obj_point_indices = example["obj_point_indices"]
         # obj_point_indices = box_np_ops.points_in_rbbox(points, gt_boxes_3d.numpy())
 
         #! 区分地面/非地面, 前景(标注目标)/背景点云
@@ -834,39 +883,46 @@ class Nuscenes2Occ3D:
         # left_points = points[background_points_indices]
         # nonground_points_bank[example['timestamp']] =  points[background_and_nonground_points_indices]
         # ground_points_bank[example['timestamp']] = points[background_and_ground_points_indices]
-
-        if not example["is_key_frame"]:
-            closed_key_frame_idx = np.argmin(
-                np.abs(self.key_frame_timestamps - timestamp)
-            )
-            keyframe_timesamp = self.key_frame_timestamps[closed_key_frame_idx]
-
-            if keyframe_timesamp not in self.background_points_bank:
-                self.waiting_for_key_frame[keyframe_timesamp].append(timestamp)
-            else:
-                # keyframe_timesamp = key_frame_timestamps[closed_key_frame_idx]
-                # keyframe_points = np.concatenate((nonground_points_bank[keyframe_timesamp], ground_points_bank[keyframe_timesamp]))
-                keyframe_points = self.background_points_bank[keyframe_timesamp]
-                keyframe_labels = keyframe_points[:, -1]
-                labels = propagate_labels_with_knn(
-                    keyframe_points[:, :3], keyframe_labels, points[:, :3]
+        if "gt_pts_semantic_mask" in annos:
+            gt_pts_semantic_mask = annos["gt_pts_semantic_mask"]  #!(n, )
+            if gt_pts_semantic_mask is None:
+                gt_pts_semantic_mask = np.zeros(len(points), dtype=np.uint8)
+            points = np.concatenate((points, gt_pts_semantic_mask[:, None]), axis=1)
+            if not example["is_key_frame"]:
+                closed_key_frame_idx = np.argmin(
+                    np.abs(self.key_frame_timestamps - timestamp)
                 )
-                points[:, -1] = labels
-        elif timestamp in self.waiting_for_key_frame:
-            non_key_frames = self.waiting_for_key_frame.pop(timestamp)
-            for non_key_frames_timestamp in non_key_frames:
-                non_keyframe_points = self.background_points_bank[
-                    non_key_frames_timestamp
-                ]
-                non_keyframe_labels = propagate_labels_with_knn(
-                    points[background_points_indices, :3],
-                    points[background_points_indices, -1],
-                    non_keyframe_points[:, :3],
-                )
-                self.background_points_bank[non_key_frames_timestamp][
-                    :, -1
-                ] = non_keyframe_labels
+                keyframe_timesamp = self.key_frame_timestamps[closed_key_frame_idx]
 
+                if keyframe_timesamp not in self.background_points_bank:
+                    self.waiting_for_key_frame[keyframe_timesamp].append(timestamp)
+                else:
+                    keyframe_points = self.background_points_bank[keyframe_timesamp]
+                    keyframe_labels = keyframe_points[:, 3]
+                    labels = propagate_labels_with_knn(
+                        keyframe_points[:, :3], keyframe_labels, points[:, :3]
+                    )
+                    points[:, 3] = labels
+            elif timestamp in self.waiting_for_key_frame:
+                non_key_frames = self.waiting_for_key_frame.pop(timestamp)
+                for non_key_frames_timestamp in non_key_frames:
+                    non_keyframe_points = self.background_points_bank[
+                        non_key_frames_timestamp
+                    ]
+                    non_keyframe_labels = propagate_labels_with_knn(
+                        points[background_points_indices, :3],
+                        points[background_points_indices, 3],
+                        non_keyframe_points[:, :3],
+                    )
+                    self.background_points_bank[non_key_frames_timestamp][
+                        :, 3
+                    ] = non_keyframe_labels
+        if "seg_logits" in example:
+            seg_logits = example["seg_logits"]
+            pred_sem = np.full_like(points[:, 0:1], 11, dtype=np.int32) # full ground idx
+            # pred_sem[nonground_points_indices] = seg_logits.reshape(-1,1)
+            pred_sem= seg_logits.reshape(-1, 1)
+            points = np.concatenate((points, pred_sem), axis=1)
         self.background_points_bank[timestamp] = points[background_points_indices]
         self.cams_bank[timestamp] = example["cams"]
         # show_result(points=points, gt_bboxes=gt_boxes_3d.clone(), pred_bboxes=None, out_dir="./viz", filename=example['sample_idx'], show=True, snapshot=True)
@@ -892,11 +948,15 @@ class Nuscenes2Occ3D:
         for i, timestamp in enumerate(tqdm(self.key_frame_timestamps)):
             cameras = self.cams_bank[timestamp]
             for camera_name, camera_data in cameras.items():
-                result = inference_segmentor(self.cv_seg_model, camera_data["data_path"])[0]
-                np.save(osp.join(f"./viz/seg_pred", osp.basename(camera_data["data_path"])),
+                result = inference_segmentor(
+                    self.cv_seg_model, camera_data["data_path"]
+                )[0]
+                np.save(
+                    osp.join(f"./viz/seg_pred", osp.basename(camera_data["data_path"])),
                     result,
                 )
                 # self.cv_seg_model.show_result(camera_data["data_path"], result, show=True)
+
 
 def assign_voxel_labels_vectorized(
     points, labels, voxel_size=0.05, pc_range=[40, 40, 5.4, -40, -40, -1], min_num=100
@@ -918,11 +978,11 @@ def assign_voxel_labels_vectorized(
     voxel_indices = np.floor(zero_point / voxel_size).astype(int)
 
     # 动态计算每个维度的跨度
-    dims = np.ceil((np.array(pc_range[:3]) - np.array(pc_range[3:])) / voxel_size).astype(int)
+    dims = np.ceil(
+        (np.array(pc_range[:3]) - np.array(pc_range[3:])) / voxel_size
+    ).astype(int)
     # 将3D索引映射为1D唯一ID
-    voxel_1d = np.ravel_multi_index(
-        (voxel_indices).T, dims, mode='clip'
-    )  # shape (N,)
+    voxel_1d = np.ravel_multi_index((voxel_indices).T, dims, mode="clip")  # shape (N,)
     # Step 3: 对体素ID排序，分组统计
     sort_idx = np.argsort(voxel_1d)
     sorted_voxel = voxel_1d[sort_idx]
@@ -951,7 +1011,7 @@ def assign_voxel_labels_vectorized(
         # 将背景标签计数设为0，不影响argmax
         # counts[unique_lbl == 0] = 0
         # if np.all(counts == 0):  # 全是背景点 → 跳过或设为0？
-            # continue
+        # continue
         # majority_label = unique_lbl[np.argmax(counts)]
         # 应用 min_num 过滤条件
         if n_points < min_num and majority_label in [11, 12, 13]:
@@ -964,39 +1024,48 @@ def assign_voxel_labels_vectorized(
     return np.stack(voxel_coords_list), np.array(voxel_labels_list)
 
 
-
-def calculate_lidar_visibility(ray_start, ray_end, occ_coords, pc_range_min, voxel_size, spatial_shape, max_length = 1440000):
+def calculate_lidar_visibility(
+    ray_start,
+    ray_end,
+    occ_coords,
+    pc_range_min,
+    voxel_size,
+    spatial_shape,
+    max_length=1440000,
+):
     """
     计算单帧下的点云可见性(全序列计算)
 
     input:
         voxel_free_count
         voxel_occ_count
-    
+
     voxel_state[voxel_free_count > 0] = 0
     voxel_state[voxel_occ_count > 0] = 1
     output:
         voxel_state
     """
-    voxel_state =  np.full((spatial_shape), -1, dtype=np.int32)
-    for i in range(int(np.ceil(ray_start.shape[0]/max_length))):
+    voxel_state = np.full((spatial_shape), -1, dtype=np.int32)
+    for i in range(int(np.ceil(ray_start.shape[0] / max_length))):
         voxel_indices, voxel_nums = ray_casting(
-                ray_start[i*max_length:(i+1)*max_length],
-                ray_end[i*max_length:(i+1)*max_length],
-                pc_range_min,
-                voxel_size,
-                spatial_shape
-            )
+            ray_start[i * max_length : (i + 1) * max_length],
+            ray_end[i * max_length : (i + 1) * max_length],
+            pc_range_min,
+            voxel_size,
+            spatial_shape,
+        )
         voxel_state = put_voxel_state(voxel_state, voxel_indices, voxel_nums)
     # voxel_points = ((voxel_coords - pc_range_min) / voxel_size - 0.5).astype(int)
-    # free_voxel = np.concatenate(free_voxels) 
+    # free_voxel = np.concatenate(free_voxels)
     # voxel_state = put_voxel_state(voxel_state, voxel_indices, voxel_nums)
     # voxel_state[free_voxel[:,0], free_voxel[:,1], free_voxel[:,2]] = 0
-    voxel_state[occ_coords[:,0], occ_coords[:,1], occ_coords[:,2]] = 1
+    voxel_state[occ_coords[:, 0], occ_coords[:, 1], occ_coords[:, 2]] = 1
     return voxel_state
 
 
-def calculate_camera_visibility(cam_infos, lidar_voxel_state, pc_range_min, voxel_size, spatial_shape):
+def calculate_camera_visibility(
+    cam_infos, lidar_voxel_state, pc_range_min, voxel_size, spatial_shape
+):
     """
     计算单帧下的相机可见度(单帧计算)
 
@@ -1011,24 +1080,31 @@ def calculate_camera_visibility(cam_infos, lidar_voxel_state, pc_range_min, voxe
         pc_range_min: (3,)
         voxel_size: (3,)
         spatial_shape: (3,)
-        
+
     """
     DEPTH_MAX = 1e2
-    update_voxel_state =  np.full((spatial_shape), -1, dtype=np.int32)
-
+    update_voxel_state = np.full((spatial_shape), -1, dtype=np.int32)
 
     # uv2points = []
     # origins = []
     cam_id_count = {}
     free_voxels_output = []
-    for cam_type, cam_info in cam_infos.items():        
-        u, v = imagesize.get(cam_info['data_path'])
-        intrinsic = cam_info['cam_intrinsic']
-        cam2ego = pyquaternion.Quaternion(cam_info['sensor2ego_rotation']).transformation_matrix
-        cam2ego[:3, 3] = cam_info['sensor2ego_translation']
-        image_coords = np.stack(np.meshgrid(np.arange(u), np.arange(v), indexing='ij'), axis=-1)
+    for cam_type, cam_info in cam_infos.items():
+        u, v = imagesize.get(cam_info["data_path"])
+        intrinsic = cam_info["cam_intrinsic"]
+        cam2ego = pyquaternion.Quaternion(
+            cam_info["sensor2ego_rotation"]
+        ).transformation_matrix
+        cam2ego[:3, 3] = cam_info["sensor2ego_translation"]
+        image_coords = np.stack(
+            np.meshgrid(np.arange(u), np.arange(v), indexing="ij"), axis=-1
+        )
         image_coords = image_coords.reshape(-1, 2)
-        image_coords = np.concatenate([image_coords, np.ones((image_coords.shape[0], 1), dtype=np.int32)], axis=-1, dtype=np.int32)
+        image_coords = np.concatenate(
+            [image_coords, np.ones((image_coords.shape[0], 1), dtype=np.int32)],
+            axis=-1,
+            dtype=np.int32,
+        )
         depth = np.full(u * v, DEPTH_MAX, dtype=np.float32)
         uvs = image_coords * depth[:, None]
         cam_coords = uvs @ np.linalg.inv(intrinsic.T)
@@ -1038,8 +1114,12 @@ def calculate_camera_visibility(cam_infos, lidar_voxel_state, pc_range_min, voxe
         # uv2points.append(ego_coords)
         # origins.append(ego_origin)
         cam_id_count[cam_type] = (u, v)
-        voxel_indices, voxel_nums = ray_casting(ego_origin, ego_coords, pc_range_min, voxel_size, spatial_shape)
-        update_voxel_state, free_voxels = camera_ray_occ(voxel_indices, voxel_nums, lidar_voxel_state, update_voxel_state)
+        voxel_indices, voxel_nums = ray_casting(
+            ego_origin, ego_coords, pc_range_min, voxel_size, spatial_shape
+        )
+        update_voxel_state, free_voxels = camera_ray_occ(
+            voxel_indices, voxel_nums, lidar_voxel_state, update_voxel_state
+        )
         free_voxels = list(free_voxels)
         assert len(free_voxels) == len(voxel_indices)
         free_voxels_output.extend(free_voxels)
@@ -1053,6 +1133,7 @@ def calculate_camera_visibility(cam_infos, lidar_voxel_state, pc_range_min, voxe
     # update_voxel_state = camera_ray_occ(List(free_voxels), lidar_voxel_state, update_voxel_state)
 
     return update_voxel_state, free_voxels_output, cam_id_count
+
 
 if __name__ == "__main__":
     from ops.mmdetection3d.tools.data_converter.nuscenes_converter import (

@@ -415,7 +415,7 @@ def fine2coarseidx(fine_name):
 
 class Nuscenes2Occ3D:
     def __init__(self, data_path, nuscenes_version="v1.0-mini"):
-        pass
+        self.nuscenes_version = nuscenes_version
         self.get_mesh_sample = False
         self.colors = generate_35_category_colors(35)
         self.pc_range = np.array([40, 40, 5.4, -40, -40, -1])
@@ -449,9 +449,9 @@ class Nuscenes2Occ3D:
         #     result = inference_segmentor(self.cv_seg_model, image_path)  # 在线推理显存吃不消
         return result
 
-    def main(self, data_path, info_path):
+    def main(self, info_path):
         
-        self.dataset = SeqNuscene(self.data_path, info_path, nuscenes_version="v1.0-mini")
+        self.dataset = SeqNuscene(self.data_path, info_path, nuscenes_version=self.nuscenes_version)
         for i in track_iter_progress(list(range(len(self.dataset)))):
             self.seq_token = self.dataset.get_token(i)
             self.sqe_save_path = self.save_path / self.seq_token
@@ -459,9 +459,6 @@ class Nuscenes2Occ3D:
             self.seq_run(i)
 
     def seq_run(self, seq_id):
-        # self.dataset = SeqNuscene(data_path, info_path, nuscenes_version="v1.0-mini")
-        # for i in track_iter_progress(list(range(len(self.dataset)))):
-        # self.seq_id = seq_id
         self.seq_dataset = self.dataset[seq_id]
         self.obj_points_bank = {}
         self.obj_info_bank = {}
@@ -478,13 +475,15 @@ class Nuscenes2Occ3D:
         if self.load_offline:
             self.save_and_load_offline(seq_id)
             all_points = list(self.background_points_bank.values())
-            all_points_arr = np.load(f"viz/local_run_cache/{seq_id}_all_points_arr.npy")
+            all_points_arr = np.load(f"runs/local_run_cache/{seq_id}_all_points_arr.npy")
         else:
             for j in track_iter_progress(list(range(len(self.seq_dataset)))):
                 self.get_frame_data(j)
             all_points = list(self.background_points_bank.values())
             all_points_arr = np.vstack(all_points).astype(np.float32)
             all_points_arr = self.filter_noise(all_points_arr)
+            self.save_and_load_offline(seq_id, load=False, save=True)
+
         # self.sample_dynamic_objects()
         # self.get_seq_image_segmentation()
         # exit()
@@ -504,7 +503,7 @@ class Nuscenes2Occ3D:
         #! 还原至单帧自车坐标系
         self.get_key_frame_data(all_points_arr, batch_id)
 
-    def save_and_load_offline(self, seq_id):
+    def save_and_load_offline(self, seq_id, load=True, save=False):
         print("\nloading offline data……")
         keys = [
             "obj_points_bank",
@@ -514,13 +513,15 @@ class Nuscenes2Occ3D:
             "frame_info_bank",
             "cams_bank",
         ]
-        # for key in keys:
-            # with open(f"viz/local_run_cache/{seq_id}_{key}.pkl", "wb") as f:
-                # pickle.dump(getattr(self, key), f)
-        for k in keys:
-            with open(f"viz/local_run_cache/{seq_id}_{k}.pkl", "rb") as f:
-                info = pickle.load(f)
-                setattr(self, k, info)
+        if save:
+            for key in keys:
+                with open(f"runs/local_run_cache/{seq_id}_{key}.pkl", "wb") as f:
+                    pickle.dump(getattr(self, key), f)
+        if load: 
+            for k in keys:
+                with open(f"runs/local_run_cache/{seq_id}_{k}.pkl", "rb") as f:
+                    info = pickle.load(f)
+                    setattr(self, k, info)
         # self.obj_points_bank = self.obj_points_bank.astype(np.float32)
         # self.background_points_bank = self.background_points_bank.astype(np.float32)
 
@@ -563,6 +564,8 @@ class Nuscenes2Occ3D:
         ).astype(np.int32)
 
         for i, timestamp in enumerate(tqdm(self.key_frame_timestamps)):
+            if (self.sqe_save_path / self.timestamp2token[timestamp]).exists():
+                continue
 
             lidar2start = self.frame_info_bank[timestamp]["lidar2start"]
             lidar2ego = self.frame_info_bank[timestamp]["lidar2ego"]
@@ -661,7 +664,7 @@ class Nuscenes2Occ3D:
                 np.array([self.voxel_size, self.voxel_size, self.voxel_size]),
                 spatial_shape,
             )
-            print(f"calculate camera visibility")
+            # print(f"calculate camera visibility")
             camera_voxel_state, free_voxels, cam_id_count = calculate_camera_visibility(
                 cameras,
                 lidar_voxel_state,
@@ -669,13 +672,14 @@ class Nuscenes2Occ3D:
                 np.array([self.voxel_size, self.voxel_size, self.voxel_size]),
                 spatial_shape,
             )
-            print(f"calculate lidar-camrea refine")
+            # print(f"calculate lidar-camrea refine")
             semantics_adjust = self.segmentation_refine(
                 cameras, free_voxels, cam_id_count, occ_dense_label, camera_voxel_state
             )
             occ_dense_label = np.where(semantics_adjust != -1, semantics_adjust, occ_dense_label)
             #! save labels
-            np.savez(self.sqe_save_path/ self.timestamp2token[timestamp] / "labels.npz", semantics=occ_dense_label, mask_lidar=lidar_voxel_state, mask_camera=camera_voxel_state)
+            (self.sqe_save_path / self.timestamp2token[timestamp]).mkdir(parents=True, exist_ok=True)
+            np.savez(self.sqe_save_path / self.timestamp2token[timestamp] / "labels.npz", semantics=occ_dense_label, mask_lidar=lidar_voxel_state, mask_camera=camera_voxel_state)
             
             # occ_gt_path = f"{root}/{self.timestamp2token[timestamp]}/labels.npz"
             # occ_gt_info = np.load(occ_gt_path)
@@ -1049,7 +1053,7 @@ def calculate_lidar_visibility(
     pc_range_min,
     voxel_size,
     spatial_shape,
-    max_length=1440000,
+    max_length=1000000,
 ):
     """
     计算单帧下的点云可见性(全序列计算)
@@ -1159,12 +1163,12 @@ if __name__ == "__main__":
     )
 
     # create_nuscenes_infos(
-    #     # '/media/chen/Elements/nuScenes/raw/Trainval/',
-    #     "/media/chen/data/nusecnes/v1.0-mini",
+    #     '/media/chen/090/nuScenes',
+    #     # "/media/chen/data/nusecnes/v1.0-mini",
     #     info_prefix="test",
-    #     version="v1.0-mini",
+    #     version="v1.0-trainval",
     #     get_seg=True,
     # )
-    nusc2occ = Nuscenes2Occ3D()
-    nusc2occ.main("/media/chen/data/nusecnes/v1.0-mini/", "test_infos_train.pkl")
+    nusc2occ = Nuscenes2Occ3D("/media/chen/090/nuScenes", nuscenes_version="v1.0-trainval")
+    nusc2occ.main("test_infos_val.pkl")
     # main("/media/chen/data/nusecnes/v1.0-mini/", "test_infos_train.pkl")

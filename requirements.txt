@@ -1,7 +1,13 @@
-cumm-cu118==0.4.11
 mmcls==0.25.0
 mmcv-full==1.5.3
 mmdet==2.25.1
 mmdet3d==1.0.0rc4
 mmengine==0.10.7
-mmsegmentation==0.25.0
+mmsegmentation==0.26.0
+imagesize
+numpy==1.23.0
+numba==0.53.0
+torch==1.13.1+cu117
+huggingface_hub==0.24.6
+timm==0.6.11
+vdbfusion

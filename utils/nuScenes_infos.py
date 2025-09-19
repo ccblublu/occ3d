@@ -86,6 +86,27 @@ NUSC_COARSE2IDX = {
     "manmade": 15,
     "vegetation": 16,
 }
+ONTIME2IDX = {
+            "bicycle": 5,
+            "building": 8,
+            "bus": 2,
+            "car": 0,
+            "cone": 9,
+            "crowd": 10,
+            "curbside": 11,
+            "fence": 12,
+            "motorcycle": 4,
+            "other_ground": 13,
+            "other_object": 14,
+            "other_structure": 15,
+            "pedestrian": 7,
+            "pole": 16,
+            "road": 17,
+            "tree": 18,
+            "tricycle": 6,
+            "truck": 1,
+            "vegetation": 19,
+        }
 
 NUSC_FINEIDX2COARSEIDX = {
     0: 0,

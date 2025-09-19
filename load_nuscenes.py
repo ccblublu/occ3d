@@ -37,7 +37,7 @@ from utils.ops import generate_35_category_colors, rotate_yaw, viz_mesh, viz_occ
 from utils.ray_operation import *
 from utils.nuScenes_infos import *
 # from ops.segmentation.image_segmentaiton import init_model
-from utils import data_pipeline #! have to import 
+from utils import data_pipeline #! have to import
 
 # import ray_casting_cuda
 
@@ -51,10 +51,11 @@ class LiDARInstance3DBoxeswithID(LiDARInstance3DBoxes):
 
 
 class SeqNuscene(Dataset):
+
     def __init__(self, data_root, anno_file, nuscenes_version="v1.0-trainval"):
         self.data_root = data_root
         self.anno_file = anno_file
-        nuscenes_version = nuscenes_version
+        # nuscenes_version = nuscenes_version
         # dataroot = './data/nuscenes/'
         self.nuscenes = NuScenes(nuscenes_version, data_root)
         anno_data = mmcv_load(osp.join(data_root, anno_file))
@@ -72,17 +73,51 @@ class SeqNuscene(Dataset):
         out = []
         self.seq_token = []
         for key, value in seq_data.items():
-            out.append(init_dataset(value, key))
+            out.append(self.init_dataset(value, key))
             self.seq_token.append(key)
 
         return out
+
+    def init_dataset(self, data, token):
+        dataset_cfg = dict(type="SequenceDataset", data=data, token=token)
+        dataset_cfg.update(
+            # use_valid_flag=True,
+            pipeline=[
+                dict(type="LoadPointsFromFile",
+                     coord_type="LIDAR",
+                     load_dim=5,
+                     use_dim=5),
+                dict(type="RemoveSelfCenter", radius=2.5),
+                dict(type="GetGround"),
+                dict(type="LoadAnnotations3D",
+                     with_bbox_3d=True,
+                     with_label_3d=True),
+                dict(type="GetBoxPointIndices"),
+                # dict(
+                #     type="PtsSegment",
+                #     checkpoint_path="/home/chen/workspace/points_segmentation/PointTransformerV3/Pointcept/runs/ontime_wo_ground/model/model_best.pth",
+                #     # checkpoint_path="/media/chen/workspace/workspace/points_segmentation/PointTransformerV3/Pointcept/models/model_best.pth", # nuscenes
+                #     grid_size=0.05,
+                #     hash_type="fnv",
+                #     mode="train",
+                #     return_inverse=True,
+                #     return_grid_coord=True,
+                #     return_min_coord=False,
+                #     return_displacement=False,
+                #     project_displacement=False,
+                # ),
+                dict(type="GlobalAlignmentwithGT"),  #! 自由度太少，框有误差，先单帧取点云再拼接
+            ])
+
+        dataset = build_dataset(dataset_cfg)
+        return dataset
 
     def __len__(self):
         return len(self.seq_data)
 
     def __getitem__(self, index):
         return self.seq_data[index]
-    
+
     def get_token(self, index):
         return self.seq_token[index]
 
@@ -242,37 +277,6 @@ class SequenceDataset(Dataset):
         return anns_results
 
 
-def init_dataset(data, token):
-    dataset_cfg = dict(type="SequenceDataset", data=data, token=token)
-    dataset_cfg.update(
-        # use_valid_flag=True,
-        pipeline=[
-            dict(type="LoadPointsFromFile", coord_type="LIDAR", load_dim=5, use_dim=5),
-            dict(type="RemoveSelfCenter", radius=2.5),
-            dict(type="GetGround"),
-            dict(type="LoadAnnotations3D", with_bbox_3d=True, with_label_3d=True),
-            dict(type="GetBoxPointIndices"),
-            # dict(
-            #     type="PtsSegment",
-            #     # checkpoint_path="/home/chen/workspace/points_segmentation/PointTransformerV3/Pointcept/runs/ontime_wo_ground/model/model_best.pth",
-            #     checkpoint_path="/media/chen/workspace/workspace/points_segmentation/PointTransformerV3/Pointcept/models/model_best.pth", # nuscenes
-            #     grid_size=0.05,
-            #     hash_type="fnv",
-            #     mode="train",
-            #     return_inverse=True,
-            #     return_grid_coord=True,
-            #     return_min_coord=False,
-            #     return_displacement=False,
-            #     project_displacement=False,
-            # ),
-            dict(
-                type="GlobalAlignmentwithGT"
-            ),  #! 自由度太少，框有误差，先单帧取点云再拼接
-        ]
-    )
-
-    dataset = build_dataset(dataset_cfg)
-    return dataset
 
 
 def get_mesh(points, voxel_size=0.1, sdf_trunc=0.3, min_weight=0):
@@ -414,6 +418,7 @@ def fine2coarseidx(fine_name):
 
 
 class Nuscenes2Occ3D:
+
     def __init__(self, data_path, nuscenes_version="v1.0-mini"):
         self.nuscenes_version = nuscenes_version
         self.get_mesh_sample = False
@@ -440,7 +445,7 @@ class Nuscenes2Occ3D:
         self.ade20k2nuscidx = np.vectorize(ADE20K2NUSC.get)
 
     def get_semantic(self, image_path):
-        result = np.load(self.data_path / "seg_pred" / self.seq_token / f"{Path(image_path).name}.npy"        )
+        result = np.load(self.data_path / "seg_pred" / self.seq_token / f"{Path(image_path).name}.npy")
         # if self.load_offline:
         #     result = np.load(
         #         osp.join("viz/seg_pred", osp.basename(image_path) + ".npy")
@@ -450,8 +455,10 @@ class Nuscenes2Occ3D:
         return result
 
     def main(self, info_path):
-        
-        self.dataset = SeqNuscene(self.data_path, info_path, nuscenes_version=self.nuscenes_version)
+
+        self.dataset = SeqNuscene(self.data_path,
+                                  info_path,
+                                  nuscenes_version=self.nuscenes_version)
         for i in track_iter_progress(list(range(len(self.dataset)))):
             self.seq_token = self.dataset.get_token(i)
             self.sqe_save_path = self.save_path / self.seq_token
@@ -475,7 +482,8 @@ class Nuscenes2Occ3D:
         if self.load_offline:
             self.save_and_load_offline(seq_id)
             all_points = list(self.background_points_bank.values())
-            all_points_arr = np.load(f"runs/local_run_cache/{seq_id}_all_points_arr.npy")
+            all_points_arr = np.load(
+                f"runs/local_run_cache/{seq_id}_all_points_arr.npy")
         else:
             for j in track_iter_progress(list(range(len(self.seq_dataset)))):
                 self.get_frame_data(j)
@@ -488,13 +496,13 @@ class Nuscenes2Occ3D:
         # self.get_seq_image_segmentation()
         # exit()
 
-        batch_id = np.concatenate(
-            [
-                np.full(len(points), i)
-                for i, points in enumerate(list(self.background_points_bank.values()))
-            ]
-        )
-        all_points_arr, batch_id = self.filter_dynamic_points(all_points_arr, batch_id, idx=-1)
+        batch_id = np.concatenate([
+            np.full(len(points), i) for i, points in enumerate(
+                list(self.background_points_bank.values()))
+        ])
+        all_points_arr, batch_id = self.filter_dynamic_points(all_points_arr,
+                                                              batch_id,
+                                                              idx=-1)
 
         #! 先采样再重建
         if self.get_mesh_sample:
@@ -526,7 +534,7 @@ class Nuscenes2Occ3D:
         # self.background_points_bank = self.background_points_bank.astype(np.float32)
 
     def filter_dynamic_points(self, points, batch_id, idx=-1):
-        mask = np.logical_or(points[:, idx] >= 1, points[:, idx] <= 10)
+        mask = np.logical_or(points[:, idx] == 1, points[:, idx] > 10)
         return points[mask], batch_id[mask]
 
     def put_dynamic_objects(self, timestamp):
@@ -544,8 +552,7 @@ class Nuscenes2Occ3D:
             points_ego = points @ rotate_yaw(box[6]) + box[:3]
             label = self.obj_points_bank[obj_id]["label"]
             points = np.concatenate(
-                [points_ego, np.full((len(points), 1), label)], axis=1
-            )
+                [points_ego, np.full((len(points), 1), label)], axis=1)
             frame_obj_points.append(points)
 
         return np.concatenate(frame_obj_points, axis=0)
@@ -556,12 +563,11 @@ class Nuscenes2Occ3D:
 
         #! 获取序列下的自车坐标
         lidars2start = np.array(
-            [i["lidar2start"] for i in self.frame_info_bank.values()]
-        )
-        lidars2egos = np.array([i["lidar2ego"] for i in self.frame_info_bank.values()])
-        spatial_shape = (
-            (self.pc_range[:3] - self.pc_range[3:]) / self.voxel_size
-        ).astype(np.int32)
+            [i["lidar2start"] for i in self.frame_info_bank.values()])
+        lidars2egos = np.array(
+            [i["lidar2ego"] for i in self.frame_info_bank.values()])
+        spatial_shape = ((self.pc_range[:3] - self.pc_range[3:]) /
+                         self.voxel_size).astype(np.int32)
 
         for i, timestamp in enumerate(tqdm(self.key_frame_timestamps)):
             if (self.sqe_save_path / self.timestamp2token[timestamp]).exists():
@@ -571,12 +577,8 @@ class Nuscenes2Occ3D:
             lidar2ego = self.frame_info_bank[timestamp]["lidar2ego"]
             cameras = self.cams_bank[timestamp]
 
-            ego2cars = (
-                lidars2egos
-                @ np.linalg.inv(lidars2start)
-                @ lidar2start
-                @ np.linalg.inv(lidar2ego)
-            )
+            ego2cars = (lidars2egos @ np.linalg.inv(lidars2start) @ lidar2start
+                        @ np.linalg.inv(lidar2ego))
 
             # ego2lidars = (
             #     np.linalg.inv(lidars2start)
@@ -586,51 +588,46 @@ class Nuscenes2Occ3D:
             #! 获取当前帧下的序列轨迹坐标点
             trajectory_pose = np.linalg.inv(ego2cars)[:, :3, -1]
             trajectory_voxel = np.floor(
-                (trajectory_pose - np.array(self.pc_range[3:])) / self.voxel_size
-            ).astype(np.int32)
+                (trajectory_pose - np.array(self.pc_range[3:])) /
+                self.voxel_size).astype(np.int32)
             car_gemotry = np.stack(
-                np.meshgrid([-1, 0, 1], [-1, 0, 1], [-1, 0, 1]), -1
-            ).reshape(-1, 1, 3)
+                np.meshgrid([-1, 0, 1], [-1, 0, 1], [-1, 0, 1]),
+                -1).reshape(-1, 1, 3)
             trajectory_voxel = (trajectory_voxel + car_gemotry).reshape(-1, 3)
-            ego_sem = np.full(len(trajectory_voxel), 31, dtype=np.int32)
+            # ego_sem = np.full(len(trajectory_voxel), 31, dtype=np.int32)
 
             local_points = all_points_arr[:, [0, 1, 2, -1]].copy()
             dynamic_points = self.put_dynamic_objects(timestamp)
             local_points = np.concatenate([local_points, dynamic_points], axis=0)
             local_points[:, :3] = (
                 local_points[:, :3] - lidar2start[:3, 3]
-            ) @ lidar2start[
-                :3, :3
-            ]  #! at lidar coordinate
-            local_points[:, :3] = (
-                local_points[:, :3] @ lidar2ego[:3, :3].T + lidar2ego[:3, 3]
-            )
-            # dynamic_points = self.put_dynamic_objects(timestamp)
-            # local_points = np.concatenate([local_points, dynamic_points], axis=0)
+            ) @ lidar2start[:3, :3]  #! at lidar coordinate
+            local_points[:, :3] = (local_points[:, :3] @ lidar2ego[:3, :3].T +
+                                   lidar2ego[:3, 3])
             local_batch_id = np.concatenate(
                 [
                     batch_id,
                     np.full(
                         len(dynamic_points),
-                        list(self.background_points_bank.keys()).index(timestamp),
+                        list(self.background_points_bank.keys()).index(
+                            timestamp),
                     ),
                 ],
                 axis=0,
             )
+            # local_batch_id = batch_id
             points_origin = trajectory_pose[local_batch_id]  #! broadcast yyds
 
             #! 范围需要二次确认后统一： 范围确认无误，但在体素化时，需要转到第一象限进行操作以确保【取整】的一致性
             # range_mask = np.logical_and.reduce([np.abs(local_points[:, 0]) < 40, np.abs(local_points[:, 1]) < 40, local_points[:, 2] > -1, local_points[:, 2] < 5.4])
-            range_mask = np.logical_and.reduce(
-                [
-                    local_points[:, 0] < self.pc_range[0] - self.eps,
-                    local_points[:, 1] < self.pc_range[1] - self.eps,
-                    local_points[:, 2] < self.pc_range[2] - self.eps,
-                    local_points[:, 0] > self.pc_range[3] + self.eps,
-                    local_points[:, 1] > self.pc_range[4] + self.eps,
-                    local_points[:, 2] > self.pc_range[5] + self.eps,
-                ]
-            )
+            range_mask = np.logical_and.reduce([
+                local_points[:, 0] < self.pc_range[0] - self.eps,
+                local_points[:, 1] < self.pc_range[1] - self.eps,
+                local_points[:, 2] < self.pc_range[2] - self.eps,
+                local_points[:, 0] > self.pc_range[3] + self.eps,
+                local_points[:, 1] > self.pc_range[4] + self.eps,
+                local_points[:, 2] > self.pc_range[5] + self.eps,
+            ])
 
             local_points = local_points[range_mask]
             points_origin = points_origin[range_mask]
@@ -648,7 +645,15 @@ class Nuscenes2Occ3D:
                 local_points[:, -1],
                 voxel_size=self.voxel_size,
                 pc_range=self.pc_range,
+                # min_num=30,
+                # forground_idx=list(range(1, 9))
+                
             )
+            # labels = np.concatenate([occ_coords, voxel_labels_.reshape(-1, 1)], axis=1)
+            # np.save(f"runs/debug/{timestamp}_labels.npy", labels)
+            # pcd = viz_occ(occ_coords, voxel_labels_, save=False, viz=False)
+            # o3d.io.write_point_cloud(
+            #     f"runs/debug/{self.timestamp2token[timestamp]}.ply", pcd)
             # relative_voxel_coords_ = ((voxel_coords_ - self.pc_range[3:]) / self.voxel_size - 0.5).astype(int)
             occ_dense_label = np.full((spatial_shape), 17, dtype=np.int32)  #! 17 free
             occ_dense_label[occ_coords[:, 0], occ_coords[:, 1], occ_coords[:, 2]] = (
@@ -679,8 +684,12 @@ class Nuscenes2Occ3D:
             occ_dense_label = np.where(semantics_adjust != -1, semantics_adjust, occ_dense_label)
             #! save labels
             (self.sqe_save_path / self.timestamp2token[timestamp]).mkdir(parents=True, exist_ok=True)
-            np.savez(self.sqe_save_path / self.timestamp2token[timestamp] / "labels.npz", semantics=occ_dense_label, mask_lidar=lidar_voxel_state, mask_camera=camera_voxel_state)
-            
+            np.savez(self.sqe_save_path / self.timestamp2token[timestamp] /
+                     "labels.npz",
+                     semantics=occ_dense_label,
+                     mask_lidar=lidar_voxel_state,
+                     mask_camera=camera_voxel_state)
+
             # occ_gt_path = f"{root}/{self.timestamp2token[timestamp]}/labels.npz"
             # occ_gt_info = np.load(occ_gt_path)
             # occ_gt = occ_gt_info["semantics"].reshape(-1)
@@ -719,9 +728,8 @@ class Nuscenes2Occ3D:
             # ].T + lidar2start[:3, 3]
             # print(f"get image segmentation: {timestamp}")
 
-    def segmentation_refine(
-        self, cam_infos, free_voxels, cam_id_count, voxel_labels_, camera_voxel_state
-    ):
+    def segmentation_refine(self, cam_infos, free_voxels, cam_id_count,
+                            voxel_labels_, camera_voxel_state):
         start_pos = 0
         semantics_adjust = np.full_like(voxel_labels_, -1)
         color = generate_35_category_colors(17)
@@ -730,7 +738,7 @@ class Nuscenes2Occ3D:
             point_count = max_u * max_v
             semantics = self.get_semantic(cam_info["data_path"])  #! h*w
             nusc_semantics = self.ade20k2nuscidx(semantics)
-            free_voxel = List(free_voxels[start_pos : start_pos + point_count])
+            free_voxel = List(free_voxels[start_pos: start_pos + point_count])
             semantics_adjust = image_guided_voxel_refinement(
                 semantics_adjust,
                 nusc_semantics,
@@ -753,9 +761,7 @@ class Nuscenes2Occ3D:
             # )
         return semantics_adjust
 
-    def sample_dynamic_objects(
-        self,
-    ):
+    def sample_dynamic_objects(self, ):
 
         for obj_id, data in self.obj_points_bank.items():
             points = data["points"]
@@ -772,8 +778,7 @@ class Nuscenes2Occ3D:
             mesh_points = o3d.geometry.PointCloud()
             mesh_points.points = o3d.utility.Vector3dVector(viz_points[:, :3])
             voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(
-                mesh_points, voxel_size=0.05
-            )
+                mesh_points, voxel_size=0.05)
             # viz_mesh(voxel_grid, gt_box.copy(), save=False)
 
             # 原始点云
@@ -789,18 +794,14 @@ class Nuscenes2Occ3D:
 
             mesh_points = mesh.sample_points_poisson_disk(len(viz_points) * 2)
             points = np.asarray(mesh_points.points)
-            points = points[
-                np.logical_and.reduce(
-                    [
-                        points[:, 0] >= -gt_box[0, 3] / 2,
-                        points[:, 0] <= gt_box[0, 3] / 2,
-                        points[:, 1] >= -gt_box[0, 4] / 2,
-                        points[:, 1] <= gt_box[0, 4] / 2,
-                        points[:, 2] >= 0,
-                        points[:, 2] <= gt_box[0, 5],
-                    ]
-                )
-            ]
+            points = points[np.logical_and.reduce([
+                points[:, 0] >= -gt_box[0, 3] / 2,
+                points[:, 0] <= gt_box[0, 3] / 2,
+                points[:, 1] >= -gt_box[0, 4] / 2,
+                points[:, 1] <= gt_box[0, 4] / 2,
+                points[:, 2] >= 0,
+                points[:, 2] <= gt_box[0, 5],
+            ])]
             # mesh_points.points = o3d.utility.Vector3dVector(
             #     np.vstack((points, viz_points[:, :3]))
             # )
@@ -829,9 +830,11 @@ class Nuscenes2Occ3D:
     def filter_noise(self, all_points_arr):
         """噪音点云二次赋值"""
         noise_points_index = np.where(all_points_arr[:, 3] == 0)[0]
-        comfirm_points_index = np.setdiff1d(
-            np.arange(len(all_points_arr)), noise_points_index
-        )
+        if len(noise_points_index) == 0:
+            return all_points_arr
+
+        comfirm_points_index = np.setdiff1d(np.arange(len(all_points_arr)),
+                                            noise_points_index)
         noise_points_labels = propagate_labels_with_knn(
             all_points_arr[comfirm_points_index, :3],
             all_points_arr[comfirm_points_index, 3],
@@ -844,8 +847,7 @@ class Nuscenes2Occ3D:
 
     def mesh_and_sample(self, all_points_arr):
         sample_points, sample_labels = assign_voxel_labels_vectorized(
-            all_points_arr[:, :3], all_points_arr[:, -1], voxel_size=0.01
-        )
+            all_points_arr[:, :3], all_points_arr[:, -1], voxel_size=0.01)
         scene_mesh = get_mesh([sample_points])
         # # viz_mesh(scene_mesh, save=True)
         mesh_pcd = scene_mesh.sample_points_poisson_disk(len(all_points_arr))
@@ -857,8 +859,7 @@ class Nuscenes2Occ3D:
             distance_threshold=0.5,
         )
         mesh_points = np.concatenate(
-            [mesh_points, mesh_point_labels.reshape(-1, 1)], axis=-1
-        )
+            [mesh_points, mesh_point_labels.reshape(-1, 1)], axis=-1)
 
         return mesh_points
 
@@ -866,8 +867,7 @@ class Nuscenes2Occ3D:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(all_points[:, :3])
         pcd.colors = o3d.utility.Vector3dVector(
-            self.colors[all_points[:, -1].astype(int)]
-        )
+            self.colors[all_points[:, -1].astype(int)])
         o3d.io.write_point_cloud(f"./viz/{obj_id}.ply", pcd)
 
     def get_frame_data(self, index):
@@ -912,38 +912,36 @@ class Nuscenes2Occ3D:
             points = np.concatenate((points, gt_pts_semantic_mask[:, None]), axis=1)
             if not example["is_key_frame"]:
                 closed_key_frame_idx = np.argmin(
-                    np.abs(self.key_frame_timestamps - timestamp)
-                )
-                keyframe_timesamp = self.key_frame_timestamps[closed_key_frame_idx]
+                    np.abs(self.key_frame_timestamps - timestamp))
+                keyframe_timesamp = self.key_frame_timestamps[
+                    closed_key_frame_idx]
 
                 if keyframe_timesamp not in self.background_points_bank:
                     self.waiting_for_key_frame[keyframe_timesamp].append(timestamp)
                 else:
                     keyframe_points = self.background_points_bank[keyframe_timesamp]
                     keyframe_labels = keyframe_points[:, 3]
-                    labels = propagate_labels_with_knn(
-                        keyframe_points[:, :3], keyframe_labels, points[:, :3]
-                    )
+                    labels = propagate_labels_with_knn(keyframe_points[:, :3],
+                                                       keyframe_labels,
+                                                       points[:, :3])
                     points[:, 3] = labels
             elif timestamp in self.waiting_for_key_frame:
                 non_key_frames = self.waiting_for_key_frame.pop(timestamp)
                 for non_key_frames_timestamp in non_key_frames:
                     non_keyframe_points = self.background_points_bank[
-                        non_key_frames_timestamp
-                    ]
+                        non_key_frames_timestamp]
                     non_keyframe_labels = propagate_labels_with_knn(
                         points[background_points_indices, :3],
                         points[background_points_indices, 3],
                         non_keyframe_points[:, :3],
                     )
-                    self.background_points_bank[non_key_frames_timestamp][
-                        :, 3
-                    ] = non_keyframe_labels
+                    self.background_points_bank[
+                        non_key_frames_timestamp][:, 3] = non_keyframe_labels
         if "seg_logits" in example:
             seg_logits = example["seg_logits"]
             pred_sem = np.full_like(points[:, 0:1], 11, dtype=np.int32) # full ground idx
             # pred_sem[nonground_points_indices] = seg_logits.reshape(-1,1)
-            pred_sem= seg_logits.reshape(-1, 1)
+            pred_sem = seg_logits.reshape(-1, 1)
             points = np.concatenate((points, pred_sem), axis=1)
         self.background_points_bank[timestamp] = points[background_points_indices]
         self.cams_bank[timestamp] = example["cams"]
@@ -962,8 +960,7 @@ class Nuscenes2Occ3D:
             gt_points[:, :3] = gt_points[:, :3] @ rotate_yaw(box[6]).T
             self.obj_points_bank[obj_id]["points"].append(gt_points)
             self.obj_points_bank[obj_id]["size"] = np.maximum(
-                self.obj_points_bank[obj_id]["size"], box[3:6]
-            )
+                self.obj_points_bank[obj_id]["size"], box[3:6])
         return
 
     # def get_seq_image_segmentation(self):
@@ -981,7 +978,7 @@ class Nuscenes2Occ3D:
 
 
 def assign_voxel_labels_vectorized(
-    points, labels, voxel_size=0.05, pc_range=[40, 40, 5.4, -40, -40, -1], min_num=100
+    points, labels, voxel_size=0.05, pc_range=[40, 40, 5.4, -40, -40, -1], min_num=100, forground_idx=list(range(1,11)),
 ):
     """
     使用向量化操作高效地为体素分配标签
@@ -1036,7 +1033,7 @@ def assign_voxel_labels_vectorized(
         # continue
         # majority_label = unique_lbl[np.argmax(counts)]
         # 应用 min_num 过滤条件
-        if n_points < min_num and majority_label in [11, 12, 13]:
+        if n_points < min_num and majority_label not in forground_idx:
             continue
         voxel_labels_list.append(majority_label)
         voxel_coords_list.append(voxel_coords[i])
@@ -1158,9 +1155,7 @@ def calculate_camera_visibility(
 
 
 if __name__ == "__main__":
-    from ops.mmdetection3d.tools.data_converter.nuscenes_converter import (
-        create_nuscenes_infos,
-    )
+    from ops.mmdetection3d.tools.data_converter.nuscenes_converter import create_nuscenes_infos
 
     # create_nuscenes_infos(
     #     '/media/chen/090/nuScenes',

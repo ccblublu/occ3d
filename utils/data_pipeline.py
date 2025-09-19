@@ -34,9 +34,10 @@ class RemoveSelfCenter(object):
         keep_indices = np.where(dist > self.radius)[0]
         input_dict["points"] = input_dict["points"][keep_indices]
         if input_dict["is_key_frame"]:
-            input_dict["ann_info"]["gt_pts_semantic_mask"] = input_dict["ann_info"][
+            if "gt_pts_semantic_mask" in  input_dict["ann_info"] and input_dict["ann_info"]["gt_pts_semantic_mask"] is not None:
+                input_dict["ann_info"]["gt_pts_semantic_mask"] = input_dict["ann_info"][
                 "gt_pts_semantic_mask"
-            ][keep_indices]
+                ][keep_indices]
         return input_dict
 
 
@@ -98,18 +99,20 @@ class GlobalAlignmentwithGT:
 
 @PIPELINES.register_module()
 class PtsSegment:
+
     def __init__(
-            self,
-            checkpoint_path,
-            grid_size=0.05,
-            hash_type="fnv",
-            mode="train",
-            return_inverse=False,
-            return_grid_coord=False,
-            return_min_coord=False,
-            return_displacement=False,
-            project_displacement=False,
-            # keys=("coord", "normal"),
+        self,
+        checkpoint_path,
+        grid_size=0.05,
+        hash_type="fnv",
+        mode="train",
+        return_inverse=False,
+        return_grid_coord=False,
+        return_min_coord=False,
+        return_displacement=False,
+        project_displacement=False,
+        num_classes=19,
+        # keys=("coord", "normal"),
     ):
         self.grid_size = grid_size
         self.hash_type = hash_type
@@ -124,8 +127,8 @@ class PtsSegment:
 
         model_config = dict(
             type="DefaultSegmentorV2",
-            num_classes=16,
-            # num_classes=19,
+            # num_classes=16,
+            num_classes=num_classes,
             backbone_out_channels=64,
             backbone=dict(
                 type="PT-v3m1",
@@ -186,25 +189,48 @@ class PtsSegment:
         #     i: NUSC_COARSE2IDX[v]
         #     for i, (k, v) in enumerate(seg_map.items())
         # }
-        names = [
-            "barrier",
-            "bicycle",
-            "bus",
-            "car",
-            "construction_vehicle",
-            "motorcycle",
-            "pedestrian",
-            "traffic_cone",
-            "trailer",
-            "truck",
-            "driveable_surface",
-            "other_flat",
-            "sidewalk",
-            "terrain",
-            "manmade",
-            "vegetation",
-        ]
-        self.seg_index_map = {i:i + 1 for i, v in enumerate(names)} # ignore 0
+
+        # names = [
+        #     "barrier",
+        #     "bicycle",
+        #     "bus",
+        #     "car",
+        #     "construction_vehicle",
+        #     "motorcycle",
+        #     "pedestrian",
+        #     "traffic_cone",
+        #     "trailer",
+        #     "truck",
+        #     "driveable_surface",
+        #     "other_flat",
+        #     "sidewalk",
+        #     "terrain",
+        #     "manmade",
+        #     "vegetation",
+        # ]
+        # self.seg_index_map = {i:i + 1 for i, v in enumerate(names)} # ignore 0
+        seg_map = {
+            "bicycle": 5,
+            "building": 8,
+            "bus": 2,
+            "car": 0,
+            "cone": 9,
+            "crowd": 10,
+            "curbside": 11,
+            "fence": 12,
+            "motorcycle": 4,
+            "other_ground": 13,
+            "other_object": 14,
+            "other_structure": 15,
+            "pedestrian": 7,
+            "pole": 16,
+            "road": 17,
+            "tree": 18,
+            "tricycle": 6,
+            "truck": 1,
+            "vegetation": 19,
+        }
+        self.seg_index_map = {i: v for i, (k, v) in enumerate(seg_map.items())}
         self.seg_index_map_v = np.vectorize(self.seg_index_map.get)
         self.model = build_model(model_config).cuda()
         checkpoint = torch.load(
@@ -231,13 +257,15 @@ class PtsSegment:
     @torch.inference_mode()
     def __call__(self, input_dict):
         points = input_dict["points"].tensor.numpy()[:, :4]
-        # non_ground_points = points[input_dict["nonground_idx"]]
+        non_ground_points = points[input_dict["nonground_idx"]]
         data = dict()
-        grid_infos = self.grid_sample(points)
-        data["coord"] = points[:, :3][grid_infos['idx_unique']]
-        data["strength"] = points[:, 3:4][grid_infos['idx_unique']] / 255
+        grid_infos = self.grid_sample(non_ground_points)
+        data["coord"] = non_ground_points[:, :3][grid_infos['idx_unique']]
+        data["strength"] = non_ground_points[:, 3:4][
+            grid_infos['idx_unique']] / 255
         data["grid_coord"] = grid_infos['grid_coord']
-        data['feat'] = np.concatenate([data["coord"], data["strength"]], axis=-1)
+        data['feat'] = np.concatenate([data["coord"], data["strength"]],
+                                      axis=-1)
         data['offset'] = np.array([data["coord"].shape[0]])
         for k, v in data.items():
             data[k] = torch.from_numpy(v).cuda(non_blocking=True)
